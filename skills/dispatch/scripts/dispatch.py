@@ -1227,6 +1227,10 @@ def cmd_clean(args):
     t = next((t for t in tasks if t["name"] == args.name), None)
     if not t:
         die(f"no task named {args.name}")
+    if t["where"] == "cloud" and t.get("kind") == "review":  # its report is all it left here
+        save_tasks([x for x in tasks if x["name"] != args.name])
+        print(f"removed {args.name}: a cloud review leaves nothing on this machine")
+        return
     if t["where"] != "local" and not t.get("imported"):
         die(f"{args.name} is a cloud task; there is nothing on this machine to remove. Use `forget`.")
     if t.get("imported"):  # its worktree holds pulled files; the session lives on claude.ai

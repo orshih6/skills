@@ -1212,6 +1212,11 @@ def cloud_review_checks(e):
         e.config()
         r = e.d("review", "alpha", "--local")
         has(r.stdout, "on this machine", "review --local")
+        e.d("forget", "alpha-review")
+        e.d("review", "alpha")
+        r = e.d("clean", "alpha-review")
+        has(r.stdout, "a cloud review leaves nothing", "clean of a cloud review")
+        expect(all(x["name"] != "alpha-review" for x in e.tasks()), "the cloud review's line stayed")
     finally:
         srv.shutdown()
 

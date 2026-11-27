@@ -61,6 +61,8 @@ elif args[:1] == ["rm"]:
     if target:
         shutil.rmtree(target, ignore_errors=True)
     sys.stdout.write(state("rm_output", "removed\n"))
+elif args == ["--version"]:
+    sys.stdout.write("9.9.9 (stand-in)\n")
 elif "--cloud" in args:
     sid = state("next_cloud_id", "session_07").strip()
     sys.stdout.write("Created cloud session: x\nView: https://claude.ai/code/%s?from=cli\n" % sid)
@@ -1277,6 +1279,32 @@ def import_checks(e):
         same(r.returncode, 0, f"clean of an imported cloud task ({r.stderr.strip()})")
         expect(not wt.exists(), "its worktree is gone")
         same(e.git("rev-parse", "--verify", "cloud-up") != "", True, "its branch stays")
+    finally:
+        srv.shutdown()
+
+
+@check("doctor: names each undocumented part that stopped answering")
+def doctor_checks(e):
+    live = {"cse_01": cloud_session("cse_01", "idle", "completed")}
+    srv = fake_api([], live, {"cse_01": []})
+    try:
+        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"):
+            e.env.pop(k, None)
+        e.env["DISPATCH_API_URL"] = f"http://127.0.0.1:{srv.server_address[1]}"
+        r = e.d("doctor")
+        same(r.returncode, 1, "doctor without a login")
+        has(r.stdout, "FAIL  claude.ai login", "the missing login is named")
+        (e.dir / ".claude").mkdir()
+        (e.dir / ".claude" / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "tok-123", "expiresAt": int(time.time() + 3600) * 1000}}))
+        (e.dir / ".claude.json").write_text(json.dumps({"oauthAccount": {"organizationUuid": "org-9"}}))
+        r = e.d("doctor")
+        for part in ("ok    claude CLI: 9.9.9", "ok    session list", "ok    one session",
+                     "ok    session events", "ok    environment list"):
+            has(r.stdout, part, "doctor")
+        has(r.stdout, "FAIL  upload switch", "the stand-in CLI has no upload switch")
+        has(r.stdout, "breaks cloud", "what a failure breaks")
+        same(r.returncode, 1, "doctor exit code with one failure")
     finally:
         srv.shutdown()
 

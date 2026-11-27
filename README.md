@@ -15,6 +15,7 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
 /dispatch status
 /dispatch sessions
 /dispatch envs
+/dispatch doctor
 /dispatch collect
 /dispatch review fix-flaky-login-test
 /dispatch handoff
@@ -40,19 +41,23 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
   Teleport cannot do this for a session that never pushed: it fetches code from GitHub.
 - **`envs`** lists your cloud environments as claude.ai/code has them (the same list as
   `/remote-env`), with the name your config gives each one. A cloud task can then pick
-  one by that claude.ai name: `--environment "Light"`. It uses the claude CLI's
-  own login and an undocumented API, so a Claude Code update may break it.
+  one by that claude.ai name: `--environment "Light"`. Environments are checked against
+  the login in use, so a config id from another login is never used by mistake.
 - **`collect`** first has each finished task reviewed by a new session that did not
   write it and has not seen its report, on a fresh cloud machine by default (this
-  machine when the task needs it), then gives the results in order of risk, with
+  machine when the task needs it; a cloud task's work is first put on a local branch
+  `cloud-<name>`), then gives the results in order of risk, with
   the findings the reviewer could confirm. A task whose review confirms a major problem
   goes back to a new session on the same branch with only those findings, and is
   reviewed again, up to `max_fix_rounds` times (default 2). `/dispatch review <name>`
   and `/dispatch fix <name>` do it for one task.
 - After `collect`, the finished sessions and their worktrees are removed once you
   agree. A local task's commits stay on its branch; nothing is pushed or merged for you.
-- **`handoff`** is for when you have to leave: tasks that can run in the cloud are pushed
-  to a branch and continued there; the rest are listed with how to keep them running.
+- **`handoff`** is for when you have to leave: each local task that can run in the cloud
+  commits its work in progress, and a cloud session continues it from its uploaded
+  worktree; the rest are listed with how to keep them running.
+- **`doctor`** checks, without starting a session, that the undocumented cloud parts
+  still answer, and names what breaks if one does not. Run it after a Claude Code update.
 
 To run a task on a particular model, name the model when you dispatch it; the helper
 passes it as `--model <id>`. Without one, a session uses `cloud_model` / `local_model`

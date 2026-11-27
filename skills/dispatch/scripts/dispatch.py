@@ -11,7 +11,7 @@ Standard library only. State lives in ~/.claude/dispatch/ (never in a repo):
 A review is a local task named <name>-review: a new session that did not write the
 change reads the finished task's branch and reports a verdict.
 
-Commands: local, cloud, review, fix, wait, status, envs, sessions, adopt, pull, result, clean, forget. Run with -h for flags.
+Commands: local, cloud, review, fix, wait, doctor, status, envs, sessions, adopt, pull, result, clean, forget. Run with -h for flags.
 """
 
 import argparse
@@ -1548,6 +1548,59 @@ def cmd_pull(args):
         sys.exit(6)
 
 
+def cmd_doctor(args):
+    """Check, without starting a session, that the undocumented parts dispatch relies on
+    still answer as it expects. One line per check; exit 1 when one fails."""
+    bad = 0
+
+    def line(ok, what, detail, breaks):
+        nonlocal bad
+        bad += not ok
+        print(f"{'ok  ' if ok else 'FAIL'}  {what}: {detail}" + ("" if ok else f"  -> breaks {breaks}"))
+
+    r = run(["claude", "--version"])
+    line(r.returncode == 0, "claude CLI", (r.stdout or r.stderr).strip()[:60] or "not found", "everything")
+    exe = shutil.which("claude")
+    found = False
+    if exe:
+        try:
+            with open(os.path.realpath(exe), "rb") as f:
+                import mmap
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                    found = m.find(b"CCR_FORCE_BUNDLE") != -1
+        except (OSError, ValueError):
+            found = False
+    line(found, "upload switch", "CCR_FORCE_BUNDLE is in the CLI" if found else "CCR_FORCE_BUNDLE not found in the CLI",
+         "cloud: a GitHub repo would be cloned from GitHub instead of uploaded")
+    try:
+        token, org = claude_login(soft=True)
+        line(True, "claude.ai login", f"read ({claude_config_dir() or '~/.claude'})", "")
+    except LoginMissing as e:
+        line(False, "claude.ai login", str(e), "every cloud command")
+        sys.exit(1)
+    code, body = api_call("/v1/code/sessions?limit=1", token, org)
+    rows = body.get("data") if code == 200 and isinstance(body, dict) else None
+    line(isinstance(rows, list), "session list", f"HTTP {code}", "sessions")
+    sid = rows[0].get("id") if rows else None
+    if sid:
+        code, body = api_call(f"/v1/code/sessions/{sid}", token, org)
+        one = (body.get("response_shape") or body.get("session")) if code == 200 and isinstance(body, dict) else None
+        ok = isinstance(one, dict) and "worker_status" in one
+        line(ok, "one session", f"HTTP {code}" + ("" if ok else ", no worker_status"),
+             "status, wait, result and review of cloud tasks")
+        code, body = api_call(f"/v1/code/sessions/{sid}/events?limit=5&sort_order=desc", token, org)
+        ok = code == 200 and isinstance(body, dict) and isinstance(body.get("data"), list)
+        line(ok, "session events", f"HTTP {code}", "pull, cloud reviews' reports, review of cloud tasks")
+    else:
+        print("skip  one session / session events: the account has no cloud session yet")
+    code, body = api_call("/v1/environment_providers?limit=1", token, org)
+    ok = code == 200 and isinstance(body, dict) and "environments" in body
+    line(ok, "environment list", f"HTTP {code}", "envs, and --environment / cloud_environment by name")
+    print("all good" if not bad else f"{bad} check{'s' if bad != 1 else ''} failed: a Claude Code "
+          "update may have changed them. Local tasks still work.")
+    sys.exit(1 if bad else 0)
+
+
 def cmd_envs(args):
     """One line per cloud environment: name, id, kind, state, and its role in the config."""
     cfg = load_config()
@@ -1605,6 +1658,8 @@ def main():
     s.add_argument("names", nargs="*", help="task names (default: every task)")
     s.add_argument("--timeout", type=int, default=540, help="seconds to wait at most")
     s.set_defaults(fn=cmd_wait)
+    s = sub.add_parser("doctor", help="check the cloud parts still work (starts no session)")
+    s.set_defaults(fn=cmd_doctor)
     s = sub.add_parser("envs", help="list the account's cloud environments (claude.ai/code)")
     s.add_argument("--json", action="store_true", help="print them as JSON")
     s.set_defaults(fn=cmd_envs)

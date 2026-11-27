@@ -18,7 +18,7 @@ python3 $D local  --repo <dir> --name <name> --brief-file <file> [--needs-local]
 python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch>] [--model <id>]
 python3 $D review <name> [--model <id>]
 python3 $D wait   [<name> ...] [--timeout <seconds>]
-python3 $D status
+python3 $D status [--repo <dir>]
 python3 $D result <name>
 python3 $D clean  <name>
 python3 $D forget <name>
@@ -37,9 +37,12 @@ It keeps its state in `~/.claude/dispatch/` (task list, briefs, reports), never 
 2. **Choose where each runs.**
    - **Local** is the default. A local session has the machine's files, credentials,
      signed-in tools and network.
-   - **Cloud** only when all of these hold: the repo has a GitHub remote, the work the
-     task depends on is pushed, and the task needs nothing that exists only on this
-     machine (secrets, a cluster or VPN, a signed-in browser, local media, hardware).
+   - **Cloud** only when all of these hold: the repo has a GitHub remote, the Claude
+     GitHub App is installed on that repo with write access, the work the task depends
+     on is pushed, and the task needs nothing that exists only on this machine (secrets,
+     a cluster or VPN, a signed-in browser, local media, hardware). The helper cannot
+     check the app: for a repo that has never had a cloud task come back, ask the user
+     to confirm it first (https://github.com/apps/claude/installations/select_target).
      Choose it for long work, or when the user says they will close the laptop.
    - Pass `--needs-local` for a local task that could never move to the cloud. `handoff`
      relies on it.
@@ -83,24 +86,31 @@ Run `status` and show its lines as a table. States:
   nothing yet. Their live progress is only visible at the `view:` link; nothing on this
   machine can read it.
 - `quiet`: a cloud task with nothing on GitHub after 20 minutes. It may still be
-  working, or it may be waiting on something (access to the repository, a question).
-  Give the user the link and ask them to look; do not start it again on a guess.
+  working, or it finished and could not push: without the Claude GitHub App on the
+  repo, a cloud session does the work and then has no way to send it back. Give the
+  user the link and ask them to look; do not start it again on a guess. If the push
+  failed, the user installs the app and then tells that session, in the browser, to
+  push its branch and open the pull request as its brief says.
 
 ## `/dispatch collect`
 
 A session's own report says what it believes. Before the user reads it, a session that
 did not write the change checks it.
 
-1. **Review.** For each task that reports `done` and has no `<name>-review` task yet,
-   run `review <name>`. It starts a new local session in its own worktree. That session
+1. **Review.** Run `status` to see the tasks (all repos, or `--repo <dir>` when the user
+   names one). For each task that reports `done` and has no `<name>-review` task yet,
+   run `review <name>`. Treat a `handoff` task as `done` when its report says nothing
+   is left to do. It starts a new local session in its own worktree. That session
    gets the original brief and the branch's diff, not the writer's report or reasoning.
    It marks each finding MAJOR (the change misses something the task calls done, or
    breaks something that worked) or MINOR, and CONFIRMED (reproduced, or the failing
    lines are named) or PLAUSIBLE. Do not review tasks that report `failed` or `blocked`, and skip the step
    when the user says so ("collect, no review"). The review of a cloud task also runs
    on this machine, on the branch fetched from GitHub.
-2. **Wait** for the reviews: `wait <name>-review ... --timeout 540`. If some are still
-   running when it returns, report the rest now and say which reviews are pending.
+2. **Wait** for the reviews: `wait <name>-review ... --timeout 540`. It prints the
+   status line of every task when the named ones have reported, and starts with a
+   `still running after ...` line when the time ran out first. If some reviews are
+   still running then, report the rest now and say which are pending.
 3. **Report.** Run `result <name>` and `result <name>-review` for each task and give the
    user the tasks in order of the review's `RISK`, highest first:
    - `high`, or any finding that is MAJOR and CONFIRMED: what changed, the branch or
@@ -110,13 +120,19 @@ did not write the change checks it.
      PLAUSIBLE ones named as unconfirmed.
    - `low` and `clean`: one line.
 
-   When the review's checks disagree with the writer's `TESTS` line, say so first.
+   When the writer says a check passed and the review ran the same check and it
+   failed, say so first. Small differences in wording or line numbers are not that.
+
+   Then list the tasks that have no review, with their state in a line each: still
+   running, `quiet`, `failed`, `blocked` (with its question), or not reviewed and why.
 4. **Findings are the user's call.** Do not fix them yourself and do not start a fix
    without being asked. If the user wants one, dispatch a new task whose brief names
    the branch to continue and quotes the confirmed findings.
 5. **Clean up** when the user agrees. A local task's commits exist only on its branch
-   on this machine, so first ask what to do with each branch: merge it, push it, or
-   drop it. Then `clean <name>` removes the session, its worktree and its line in the
+   on this machine (unless it handed off or was asked to push; its report says), so
+   first ask what to do with each branch: merge it, push it, or drop it. Do the merge
+   or push yourself only when the user says so for that branch. Clean a task's review
+   before the task. Then `clean <name>` removes the session, its worktree and its line in the
    list. It deletes what tools leave behind in the worktree (`__pycache__/`, `.serena/`
    and the like, plus the `leftovers` in the config) and refuses when anything else is
    uncommitted: show the user those files and do not force it. The task's commits
@@ -124,7 +140,7 @@ did not write the change checks it.
    when the first went with the worktree). Clean the review tasks the same way; a review's worktree holds nothing
    to keep. `forget <name>` only drops a line from the list, for cloud tasks.
 
-Never merge a branch or pull request yourself, whatever the review says.
+Never merge a branch or pull request on your own judgement, whatever the review says.
 
 `/dispatch review <name>` runs steps 1 to 3 for one task.
 

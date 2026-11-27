@@ -77,15 +77,24 @@ progress to `{branch}`, push that branch, and stop.
 CLOUD_REPORT = """\
 ## Reporting (required, last step)
 
-Push the branch `{branch}` and open a pull request from it (draft if unfinished). Start
-the pull request description with these lines:
+Push the branch `{branch}` and open a pull request from it (draft if unfinished). If
+the push of that branch is refused because this session may only push its own branch,
+move your commits to the session's own branch, push that one, and open the pull
+request from it. Start the pull request description with these lines:
 
+    DISPATCH: {name}
     STATUS: done | failed | blocked
     TESTS: <command you ran and whether it passed, or not run and why>
     SUMMARY: <2 to 5 lines: what changed, what is left, anything the owner must decide>
 
 If you cannot open a pull request, push the branch and add the same text as
 `DISPATCH_RESULT.md` in its last commit.
+
+If you cannot push at all (the repository refuses, or GitHub access is missing), your
+work cannot leave this machine and the owner will see nothing. Do not spend time on
+workarounds: say plainly in your last message that the push failed, why, and what the
+owner must do (usually: install the Claude GitHub App on the repository with write
+access), then stop. The owner can then tell this session to push again.
 """
 
 RULES_MARK = "## Rules for this dispatched session"
@@ -364,7 +373,7 @@ def cmd_cloud(args):
         brief,
         f"Start from the branch `{base}`.",
         RULES.format(branch=branch, extra=cfg.get("extra_rules", ""), push=CLOUD_PUSH),
-        CLOUD_REPORT.format(branch=branch),
+        CLOUD_REPORT.format(branch=branch, name=args.name),
     ])
     BRIEFS.mkdir(parents=True, exist_ok=True)
     (BRIEFS / f"{args.name}.md").write_text(full + "\n")
@@ -401,6 +410,9 @@ def review_range(t, repo):
         die(f"{t['name']} has no branch (its folder is not a git repository); there is nothing to diff")
     cloud = t["where"] == "cloud"
     if cloud:
+        pr = cloud_pr(t)
+        if pr and pr["headRefName"] != t["branch"]:
+            t["branch"] = pr["headRefName"]  # the session had to push its own branch
         run(["git", "-C", str(repo), "fetch", "--quiet", "origin", t["branch"]], timeout=120)
     ref = f"origin/{t['branch']}" if cloud else t["branch"]
     if not resolves(repo, ref):
@@ -495,17 +507,32 @@ def read_result(name):
     return status, (" ".join(s.group(1).split()) if s else "")
 
 
+def cloud_pr(t):
+    """The task's pull request: by its branch, else by the DISPATCH line in the body
+    (a cloud session that may only push its own branch opens it from that one)."""
+    if not shutil.which("gh"):
+        return None
+    fields = "url,state,isDraft,body,headRefName"
+    for find in (["--head", t["branch"]], ["--search", f'"DISPATCH: {t["name"]}" in:body']):
+        r = run(["gh", "pr", "list", *find, "--state", "all", "--json", fields, "--limit", "5"],
+                cwd=t["repo"])
+        if r.returncode != 0 or r.stdout.strip() in ("", "[]"):
+            continue
+        for pr in json.loads(r.stdout):
+            if find[0] == "--head" or re.search(rf"^\s*DISPATCH:\s*{re.escape(t['name'])}\s*$",
+                                                pr.get("body") or "", re.M):
+                return pr
+    return None
+
+
 def cloud_state(t):
     """A cloud task is judged by what reached GitHub: its branch and pull request."""
     repo = t["repo"]
-    if shutil.which("gh"):
-        r = run(["gh", "pr", "list", "--head", t["branch"], "--state", "all",
-                 "--json", "url,state,isDraft,body", "--limit", "1"], cwd=repo)
-        if r.returncode == 0 and r.stdout.strip() not in ("", "[]"):
-            pr = json.loads(r.stdout)[0]
-            m = re.search(r"STATUS:\s*(\w+)", pr.get("body") or "")
-            st = m.group(1).lower() if m else ("draft" if pr["isDraft"] else "pr-open")
-            return st, pr["url"]
+    pr = cloud_pr(t)
+    if pr:
+        m = re.search(r"STATUS:\s*(\w+)", pr.get("body") or "")
+        st = m.group(1).lower() if m else ("draft" if pr["isDraft"] else "pr-open")
+        return st, pr["url"]
     if git(repo, "ls-remote", "--heads", "origin", t["branch"]):
         return "branch-pushed", f"branch {t['branch']} (no pull request yet)"
     return "running-or-no-output", t.get("url") or ""
@@ -513,8 +540,12 @@ def cloud_state(t):
 
 def cmd_status(args):
     tasks = load_tasks()
+    only = getattr(args, "repo", None)
+    if only:
+        only = str(Path(only).expanduser().resolve())
+        tasks = [t for t in tasks if t["repo"] == only]
     if not tasks:
-        print("no dispatched tasks")
+        print("no dispatched tasks" + (f" in {only}" if only else ""))
         return
     live = sessions()
     for t in tasks:
@@ -523,7 +554,7 @@ def cmd_status(args):
             state, note = cloud_state(t)
             if state == "running-or-no-output" and age >= 20:
                 # nothing can be read from a cloud session here; only GitHub shows its work
-                state, note = "quiet", f"nothing on GitHub after {age}m; it may be stuck, open {note}"
+                state, note = "quiet", f"nothing on GitHub after {age}m; stuck or unable to push, open {note}"
         else:
             s = live.get(t["id"])
             rstat, summary = read_result(t["name"])
@@ -542,7 +573,7 @@ def cmd_status(args):
             else:
                 state, note = "gone", "session no longer listed and left no report"
         where = "review" if t.get("kind") == "review" else t["where"]
-        print(f"{t['name']:<28} {where:<6} {state:<20} {age:>4}m  {Path(t['repo']).name}  {note if 'https://' in note else note[:90]}")
+        print(f"{t['name']:<28} {where:<6} {state:<20} {age:>4}m  {Path(t['repo']).name}  {note if 'https://' in note or len(note) <= 90 else note[:89] + '…'}")
 
 
 def cmd_result(args):
@@ -648,7 +679,9 @@ def main():
             s.add_argument("--allow-unpushed", action="store_true")
         s.set_defaults(fn=fn)
 
-    sub.add_parser("status", help="one line per task").set_defaults(fn=cmd_status)
+    s = sub.add_parser("status", help="one line per task")
+    s.add_argument("--repo", help="only the tasks of this project directory")
+    s.set_defaults(fn=cmd_status)
     s = sub.add_parser("wait", help="block until local tasks report, then print status")
     s.add_argument("names", nargs="*", help="task names (default: every local task)")
     s.add_argument("--timeout", type=int, default=540, help="seconds to wait at most")

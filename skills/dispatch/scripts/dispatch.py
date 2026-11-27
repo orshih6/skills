@@ -441,8 +441,10 @@ def read_result(name):
         if n:
             note += f", {n} finding{'s' if n != 1 else ''} ({c} confirmed)"
         return status, note
-    s = re.search(r"^SUMMARY:\s*(.+)", text, re.M)
-    return status, (s.group(1).strip() if s else "")
+    # The summary is 2 to 5 lines: it may start on the SUMMARY: line or below it, and
+    # runs to the end of the report, or to another report field if one follows.
+    s = re.search(r"^SUMMARY:(.*?)(?=^(?:STATUS|BRANCH|PR|TESTS):|\Z)", text, re.M | re.S)
+    return status, (" ".join(s.group(1).split()) if s else "")
 
 
 def cloud_state(t):

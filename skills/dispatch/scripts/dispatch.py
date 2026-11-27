@@ -11,7 +11,7 @@ Standard library only. State lives in ~/.claude/dispatch/ (never in a repo):
 A review is a local task named <name>-review: a new session that did not write the
 change reads the finished task's branch and reports a verdict.
 
-Commands: local, cloud, review, wait, status, result, forget. Run with -h for flags.
+Commands: local, cloud, review, wait, status, result, clean, forget. Run with -h for flags.
 """
 
 import argparse
@@ -290,6 +290,13 @@ def cmd_local(args):
     }
     save_tasks(tasks + [task])
     print(f"started local {args.name} id={task['id']} repo={repo.name} branch={task['branch']}")
+    if use_wt:
+        ahead = git(repo, "log", "--oneline", "@{u}..HEAD").splitlines()
+        if ahead or not git(repo, "rev-parse", "--abbrev-ref", "@{u}"):
+            what = f"{len(ahead)} unpushed commit{'s' if len(ahead) != 1 else ''}" if ahead else "a branch with no upstream"
+            print(f"note: this repo has {what}. A worktree can start from the pushed state, so the "
+                  "session may not see that work. If the task depends on it, stop the session, "
+                  "then push first or use --no-worktree.")
 
 
 def spawn_in_pty(cmd, cwd, timeout=90):
@@ -531,6 +538,67 @@ def cmd_result(args):
     print(f.read_text() if f.exists() else f"no report yet; look with: claude logs {t['id']}")
 
 
+JUNK = (".serena/", "__pycache__/", ".DS_Store", ".pyc", ".pytest_cache/", ".mypy_cache/")
+
+
+def cmd_clean(args):
+    """Remove a finished local task: its session, its worktree and its line in the list."""
+    tasks = load_tasks()
+    t = next((t for t in tasks if t["name"] == args.name), None)
+    if not t:
+        die(f"no task named {args.name}")
+    if t["where"] != "local":
+        die(f"{args.name} is a cloud task; there is nothing on this machine to remove. Use `forget`.")
+    if sessions().get(t["id"], {}).get("state") == "working" and not (RESULTS / f"{args.name}.md").exists():
+        die(f"{args.name} is still running; `claude stop {t['id']}` first if you mean it")
+    wt = Path(t["repo"]) / ".claude" / "worktrees" / args.name
+    if t.get("worktree") and wt.is_dir():
+        junk = JUNK + tuple(load_config().get("leftovers", []))
+        left = [l[3:] for l in git(wt, "status", "--porcelain").splitlines()]
+        real = [f for f in left if not f.endswith(junk)]
+        if real:
+            die(f"{wt} holds changes that are not committed:\n  " + "\n  ".join(real)
+                + "\nAsk the owner what to do with them. Nothing was removed.", 6)
+        for f in left:  # files that tools leave behind, never the task's work
+            target = wt / f
+            shutil.rmtree(target) if target.is_dir() else target.unlink(missing_ok=True)
+    # `claude rm` refuses while the worktree holds commits that are on no remote, which
+    # is every local task that did what it was told and did not push. Make sure another
+    # branch holds those commits, and only then let it discard the worktree.
+    repo = t["repo"]
+    has_wt = t.get("worktree") and wt.is_dir()
+    head = git(wt, "rev-parse", "HEAD") if has_wt else ""
+    own = git(wt, "branch", "--show-current") if has_wt else ""
+
+    def holders():
+        refs = git(repo, "branch", "-a", "--contains", head, "--format=%(refname:short)").splitlines()
+        return [r for r in refs if r and r != own and not r.startswith("(")]
+
+    keep = ""
+    if head and not holders():
+        keep = f"kept/{args.name}"
+        run(["git", "-C", repo, "branch", "-f", keep, head])
+    r = run(["claude", "rm", t["id"]], timeout=120)
+    out = ANSI.sub("", r.stdout + r.stderr).strip()
+    m = re.search(r"--discard-unpushed\s+(\S+)", out)
+    if wt.is_dir() and m and head and holders():
+        r = run(["claude", "rm", t["id"], "--discard-unpushed", m.group(1)], timeout=120)
+        out = ANSI.sub("", r.stdout + r.stderr).strip()
+    if wt.is_dir():
+        die(f"`claude rm {t['id']}` did not remove the worktree:\n{out[-600:]}", 6)
+    save_tasks([x for x in tasks if x["name"] != args.name])
+    if own and resolves(repo, own) and git(repo, "rev-parse", own) == head:
+        if keep:  # the task's own branch survived, the spare one is not needed
+            run(["git", "-C", repo, "branch", "-D", keep])
+        keep = own
+    if t.get("kind") == "review":
+        # a review's own branch never has commits; -d refuses if it somehow does
+        run(["git", "-C", repo, "branch", "-d", f"worktree-{args.name}"])
+        keep = ""
+    note = f"; its commits are on the branch {keep}" if keep else ""
+    print(f"removed {args.name}: session and worktree gone{note}")
+
+
 def cmd_forget(args):
     tasks = load_tasks()
     keep = [t for t in tasks if t["name"] != args.name]
@@ -567,6 +635,7 @@ def main():
     for name, fn, text in (
         ("review", cmd_review, "start a new session that reviews a finished task's branch"),
         ("result", cmd_result, "print a task's report"),
+        ("clean", cmd_clean, "remove a finished local task's session and worktree"),
         ("forget", cmd_forget, "drop a task from the list"),
     ):
         s = sub.add_parser(name, help=text)

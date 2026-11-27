@@ -20,6 +20,7 @@ python3 $D review <name>
 python3 $D wait   [<name> ...] [--timeout <seconds>]
 python3 $D status
 python3 $D result <name>
+python3 $D clean  <name>
 python3 $D forget <name>
 ```
 
@@ -111,10 +112,13 @@ did not write the change checks it.
    the branch to continue and quotes the confirmed findings.
 5. **Clean up** when the user agrees. A local task's commits exist only on its branch
    on this machine, so first ask what to do with each branch: merge it, push it, or
-   drop it. Then `claude rm <id>` removes the session and its worktree (it refuses when
-   the worktree holds work that is not committed or pushed; do not force it without the
-   user's word), and `forget <name>` drops the task from the list. Remove the review
-   tasks the same way; a review's worktree holds nothing to keep.
+   drop it. Then `clean <name>` removes the session, its worktree and its line in the
+   list. It deletes what tools leave behind in the worktree (`__pycache__/`, `.serena/`
+   and the like, plus the `leftovers` in the config) and refuses when anything else is
+   uncommitted: show the user those files and do not force it. The task's commits
+   stay: `clean` prints the branch that holds them (`worktree-<name>`, or `kept/<name>`
+   when the first went with the worktree). Clean the review tasks the same way; a review's worktree holds nothing
+   to keep. `forget <name>` only drops a line from the list, for cloud tasks.
 
 Never merge a branch or pull request yourself, whatever the review says.
 
@@ -168,6 +172,7 @@ prints the command).
   "max_parallel": 4,
   "local_only": ["infra", "some-repo-name"],
   "notify": "notify-send 'dispatch: {name} finished'",
+  "leftovers": [".idea/"],
   "extra_rules": "- Never touch files under deploy/.\n"
 }
 ```
@@ -175,6 +180,8 @@ prints the command).
 - `max_parallel`: local sessions allowed to run at once (default 4).
 - `local_only`: repo directory names that must never go to the cloud.
 - `notify`: a command each local session runs once when it reports.
+- `leftovers`: endings of untracked paths that `clean` may delete from a worktree, on
+  top of the built-in ones.
 - `extra_rules`: lines added to every brief's rules.
 
 ## Things to know
@@ -189,7 +196,10 @@ prints the command).
   nothing, and a PLAUSIBLE finding may be wrong.
 - A local task gets its own git worktree (`<repo>/.claude/worktrees/<name>`, branch
   `worktree-<name>`), so sessions in one repo cannot touch each other's changes. The
-  worktree starts from the last commit: uncommitted changes in the repo are not in it.
+  worktree does not hold the repo's uncommitted changes, and it can start from the
+  pushed state of the branch, without local commits that are not pushed yet. The helper
+  prints a note when the repo has such commits: if the task depends on them, tell the
+  user, and push first or use `--no-worktree`.
   The helper lists `.claude/worktrees/` in the repo's `.git/info/exclude`, so the
   worktrees do not show up in `git status`.
 - A cloud session works on a clone from GitHub. It never sees local files or secrets.

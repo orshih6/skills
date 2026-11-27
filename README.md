@@ -79,3 +79,15 @@ ln -s "$PWD/skills/skills/dispatch" ~/.claude/skills/dispatch
 ```
 
 Copying the skill directory works too.
+
+### Self-test
+
+Before sending a change, run from the repository root:
+
+```bash
+python3 skills/dispatch/scripts/selftest.py
+```
+
+It checks `dispatch.py` against a stand-in `claude` in a temporary directory, so it needs
+no account and starts no real session (Python 3 and `git` only; `cloud` is not covered).
+Add a word to run only the checks whose name holds it, e.g. `selftest.py wait`.

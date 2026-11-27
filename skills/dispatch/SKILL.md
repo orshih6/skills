@@ -15,7 +15,7 @@ Everything goes through one helper:
 ```bash
 D="${CLAUDE_SKILL_DIR}/scripts/dispatch.py"   # scripts/ next to this file
 python3 $D local  --repo <dir> --name <name> --brief-file <file> [--needs-local] [--no-worktree] [--model <id>]
-python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch>] [--model <id>]
+python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch>] [--model <id>] [--environment <name|id>]
 python3 $D review <name> [--model <id>]
 python3 $D wait   [<name> ...] [--timeout <seconds>]
 python3 $D status [--repo <dir>]
@@ -195,6 +195,8 @@ prints the command).
 {
   "max_parallel": 4,
   "cloud_model": "claude-opus-5-5",
+  "cloud_environment": "light",
+  "environments": {"light": "env_...", "vpn": "env_..."},
   "local_only": ["infra", "some-repo-name"],
   "notify": "notify-send 'dispatch: {name} finished'",
   "leftovers": [".idea/"],
@@ -206,6 +208,10 @@ prints the command).
 - `cloud_model`, `local_model`: the model every cloud session, or every local session
   and review, starts on. Without them a session uses the account's default. Pass
   `--model` only when the user names a model for one task; it wins over the config.
+- `environments`: names for the user's cloud environments, each with its id (the user
+  copies the id from the environment's settings on claude.ai/code; nothing on this
+  machine can list them). `cloud_environment` is the one every cloud task uses, as a
+  name or an id. Without it a task runs on the account's default environment.
 - `local_only`: repo directory names that must never go to the cloud.
 - `notify`: a command each local session runs once when it reports.
 - `leftovers`: endings of untracked paths that `clean` may delete from a worktree, on
@@ -231,5 +237,8 @@ prints the command).
   The helper lists `.claude/worktrees/` in the repo's `.git/info/exclude`, so the
   worktrees do not show up in `git status`.
 - A cloud session works on a clone from GitHub. It never sees local files or secrets.
-  It runs on the account's default cloud environment, which the helper cannot choose:
-  that environment's setup script runs before every task, so a heavy one delays them all.
+  It runs on the config's `cloud_environment`, or on the one given with
+  `--environment` for that task. The environment's setup script runs before every
+  task, so a heavy one delays them all: pick the lightest environment that has what the
+  task needs (its network access, its secrets), and say which one you chose when you
+  tell the user what was started. The start line prints it.

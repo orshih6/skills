@@ -179,9 +179,10 @@ def load_tasks():
 
 def save_tasks(tasks):
     HOME.mkdir(parents=True, exist_ok=True)
-    for t in tasks:  # "model" is only written when one was chosen
-        if t.get("model") is None:
-            t.pop("model", None)
+    for t in tasks:  # "model" and "environment" are only written when one was chosen
+        for k in ("model", "environment"):
+            if t.get(k) is None:
+                t.pop(k, None)
     TASKS.write_text("".join(json.dumps(t) + "\n" for t in tasks))
 
 
@@ -258,6 +259,26 @@ def hide_worktrees(repo):
 def pick_model(args, cfg, where):
     """--model wins, then the config's cloud_model or local_model, then the account default."""
     return getattr(args, "model", None) or cfg.get(f"{where}_model") or None
+
+
+def pick_environment(args, cfg):
+    """The cloud environment for a task, as (label, id, extra claude arguments).
+
+    --environment wins, then the config's cloud_environment. Either may be a name from
+    the config's `environments` map or an id. Nothing chosen: the account's default.
+    """
+    want = getattr(args, "environment", None) or cfg.get("cloud_environment")
+    if not want:
+        return None, None, []
+    envs = cfg.get("environments", {})
+    env_id = envs.get(want, want)
+    if env_id.startswith("ccpool_"):  # a self-hosted environment has its own flag
+        return want, env_id, ["--environment", env_id]
+    if not env_id.startswith("env_"):
+        die(f"unknown environment {want!r}: use an id (env_... or ccpool_...) or one of the "
+            f"names in {CONFIG}: {', '.join(sorted(envs)) or 'none defined'}")
+    # a hosted environment is chosen through the setting the CLI reads its default from
+    return want, env_id, ["--settings", json.dumps({"remote": {"defaultEnvironmentId": env_id}})]
 
 
 def start_bg(repo, name, prompt, worktree, model=None):
@@ -379,8 +400,9 @@ def cmd_cloud(args):
     (BRIEFS / f"{args.name}.md").write_text(full + "\n")
 
     model = pick_model(args, cfg, "cloud")
+    env_name, env_id, env_args = pick_environment(args, cfg)
     out = spawn_in_pty(["claude", "--cloud", full, "-n", args.name]
-                       + (["--model", model] if model else []), cwd=repo)
+                       + (["--model", model] if model else []) + env_args, cwd=repo)
     if "trust this folder" in out:
         die(f"{repo} is not a trusted folder. The owner must run `claude` there once "
             "and accept the trust prompt. Do not accept it for them.", 3)
@@ -389,14 +411,16 @@ def cmd_cloud(args):
         die("could not create the cloud session:\n" + out.strip()[-600:])
     url = re.search(r"https://claude\.ai/code/\S+", out)
     task = {
-        "name": args.name, "where": "cloud", "model": model, "id": m.group(1), "repo": str(repo),
+        "name": args.name, "where": "cloud", "model": model, "environment": env_id,
+        "id": m.group(1), "repo": str(repo),
         "branch": branch, "base": args.base or git(repo, "branch", "--show-current") or None,
         "url": url.group(0).split("?")[0] if url else None,
         "started": int(time.time()),
     }
     save_tasks(tasks + [task])
     print(f"started cloud {args.name} id={task['id']} repo={repo.name} branch={branch}"
-          + (f" model={model}" if model else ""))
+          + (f" model={model}" if model else "")
+          + f" environment={env_name or 'account default'}")
     print(f"view: {task['url']}")
 
 
@@ -677,6 +701,8 @@ def main():
         else:
             s.add_argument("--base", help="branch the cloud session starts from")
             s.add_argument("--allow-unpushed", action="store_true")
+            s.add_argument("--environment", help="cloud environment: a name from the config's "
+                           "`environments`, or an id (env_... or ccpool_...)")
         s.set_defaults(fn=fn)
 
     s = sub.add_parser("status", help="one line per task")

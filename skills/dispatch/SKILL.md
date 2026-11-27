@@ -108,9 +108,7 @@ the computer is awake, and give them the options:
 
 - leave it plugged in with the lid open, or
 - stop the Mac sleeping when the lid closes: `sudo pmset -a disablesleep 1` (the user
-  runs it; undo with `0` afterwards), or
-- if `handoff_host` is set in the config and `claude-handoff` is installed, move the
-  session to that server with its conversation intact: `claude-handoff push <host>`.
+  runs it; undo with `0` afterwards).
 
 They can steer a session from their phone if it was started with Remote Control.
 
@@ -129,8 +127,7 @@ prints the command).
   "max_parallel": 4,
   "local_only": ["infra", "some-repo-name"],
   "notify": "notify-send 'dispatch: {name} finished'",
-  "extra_rules": "- Never touch files under deploy/.\n",
-  "handoff_host": "my-vps"
+  "extra_rules": "- Never touch files under deploy/.\n"
 }
 ```
 
@@ -138,7 +135,6 @@ prints the command).
 - `local_only`: repo directory names that must never go to the cloud.
 - `notify`: a command each local session runs once when it reports.
 - `extra_rules`: lines added to every brief's rules.
-- `handoff_host`: an SSH host for `claude-handoff`.
 
 ## Things to know
 

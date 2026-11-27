@@ -786,7 +786,7 @@ ENV_PAGES = {
 }
 
 
-def fake_api(seen, sessions=None):
+def fake_api(seen, sessions=None, events=None, files=None):
     import http.server
     import threading
     from urllib.parse import parse_qs, urlparse
@@ -805,6 +805,22 @@ def fake_api(seen, sessions=None):
                 more = cur + 2 < len(rows)  # two to a page, so paging is exercised
                 body, code = {"data": rows[cur:cur + 2],
                               "next_cursor": str(cur + 2) if more else None}, 200
+            elif u.path.startswith("/api/oauth/files/") and files is not None:
+                data = files.get(u.path.split("/")[4])
+                code = 200 if data is not None else 404
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(data or b"")))
+                self.end_headers()
+                self.wfile.write(data or b"")
+                return
+            elif u.path.endswith("/events") and events is not None:
+                rows = events.get(u.path.split("/")[4], [])
+                q = parse_qs(u.query)
+                cur = int(q.get("cursor", ["0"])[0])
+                desc = list(reversed(rows))  # newest first, as sort_order=desc asks
+                more = cur + 3 < len(desc)  # three to a page, so paging is exercised
+                body, code = {"data": [{"payload": x} for x in desc[cur:cur + 3]],
+                              "next_cursor": str(cur + 3) if more else None}, 200
             elif u.path.startswith("/v1/code/sessions/") and sessions is not None:
                 found = sessions.get(u.path.rsplit("/", 1)[1])
                 body, code = ({"response_shape": found}, 200) if found else ({"error": "not found"}, 404)
@@ -965,6 +981,16 @@ def cloud_checks(e):
         same({p for p, _ in seen if p.startswith("/v1/code/sessions/")},
              {f"/v1/code/sessions/cse_0{i}" for i in range(1, 7)}, "sessions asked for (session_ is cse_)")
 
+        up = cloud_task("upped", 7, old)
+        up.update(repo=str(e.repo), upload=True, branch=None)
+        with open(e.home / "tasks.jsonl", "a") as fh:
+            fh.write(json.dumps(up) + "\n")
+        live["cse_07"] = cloud_session("cse_07", "idle", "completed", line="sub added, tests pass")
+        rows, _ = e.status()
+        same((rows["upped"][1], rows["upped"][3]),
+             ("done", "sub added, tests pass; `pull upped` brings its files"), "an uploaded task that finished")
+        refused(e.d("review", "upped"), "no GitHub branch", "review of an uploaded task")
+
         r = e.d("result", "unpushed")
         same(r.returncode, 0, f"result exit code ({r.stderr.strip()})")
         for part in ("STATUS: not-pushed", "BRANCH: claude/own-branch", "UNPUSHED:", "COST: $1.50",
@@ -1035,6 +1061,64 @@ def adopt_checks(e):
         refused(e.d("adopt", "session_01", "--name", "again", "--repo", e.repo),
                 "already the task price", "adopting the same session twice")
         has(e.d("sessions").stdout.splitlines()[0], "(dispatch: price)", "sessions marks a tracked one")
+    finally:
+        srv.shutdown()
+
+
+def use(uid, name, **inp):
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": uid, "name": name, "input": inp}]}}
+
+
+def res(uid, error=False, **tur):
+    return {"type": "user", "tool_use_result": tur, "message": {"content": [
+        {"type": "tool_result", "tool_use_id": uid, "is_error": error}]}}
+
+
+@check("pull: rebuilds written files and downloads sent ones from a session's history")
+def pull_checks(e):
+    video = b"\x00\x00\x00 ftypisom" + b"x" * 5000
+    history = [
+        use("t1", "Write", file_path="/home/user/shop/new.py", content="a = 1\n"),
+        res("t1"),
+        use("t2", "Edit", file_path="/home/user/shop/new.py", old_string="a = 1", new_string="a = 2"),
+        res("t2", originalFile="a = 1\n"),
+        use("t3", "Edit", file_path="/home/user/shop/README.md", old_string="old", new_string="new"),
+        res("t3", originalFile="the old text\n"),  # a file from the upload: its result has it
+        use("t4", "Write", file_path="/home/user/shop/refused.txt", content="no"),
+        res("t4", error=True),
+        use("t5", "Edit", file_path="/home/user/shop/lost.txt", old_string="x", new_string="y"),
+        res("t5"),  # no originalFile: nothing to start from
+        use("t6", "SendUserFile", files=["/home/user/shop/out/v.mp4"]),
+        res("t6", attachments=[{"file_uuid": "f-1", "path": "/home/user/shop/out/v.mp4", "size": len(video)}]),
+        use("t7", "Write", file_path="/etc/../../escape.txt", content="no"),
+        res("t7"),
+    ]
+    live = {"cse_01": cloud_session("cse_01", "idle", "completed")}
+    srv = fake_api([], live, {"cse_01": history}, {"f-1": video})
+    try:
+        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"):
+            e.env.pop(k, None)
+        e.env["DISPATCH_API_URL"] = f"http://127.0.0.1:{srv.server_address[1]}"
+        (e.dir / ".claude").mkdir()
+        (e.dir / ".claude" / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "tok-123", "expiresAt": int(time.time() + 3600) * 1000}}))
+        (e.dir / ".claude.json").write_text(json.dumps({"oauthAccount": {"organizationUuid": "org-9"}}))
+        out = e.dir / "pulled"
+        r = e.d("pull", "session_01", "--out", out)
+        same(r.returncode, 0, f"pull exit code ({r.stderr.strip()})")
+        same((out / "shop" / "new.py").read_text(), "a = 2\n", "a written then edited file")
+        same((out / "shop" / "README.md").read_text(), "the new text\n", "an edited file from the upload")
+        same((out / "shop" / "out" / "v.mp4").read_bytes(), video, "a sent file, byte for byte")
+        expect(not (out / "shop" / "refused.txt").exists(), "a refused Write was rebuilt")
+        expect(not (out / "shop" / "lost.txt").exists(), "an edit with no starting text was rebuilt")
+        expect(not (e.dir / "escape.txt").exists(), "a path left the folder")
+        listing = (out / "PULLED.md").read_text()
+        has(listing, "skipped  /home/user/shop/lost.txt", "PULLED.md names the skipped file")
+        has(r.stdout, "pulled 3 files", "pull output")
+        refused(e.d("pull", "session_01", "--out", out), "is not empty", "pull into a full folder")
+        r = e.d("pull", "session_01", "--out", out, "--into-existing")
+        same(r.returncode, 0, "pull --into-existing")
     finally:
         srv.shutdown()
 

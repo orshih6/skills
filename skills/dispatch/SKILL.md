@@ -1,7 +1,7 @@
 ---
 name: dispatch
 description: Run tasks in other Claude Code sessions (local background sessions or cloud sessions) and manage them from this one, so the work does not fill this session's context. Use when the user wants to dispatch, delegate or fan out tasks to separate sessions, run something in the background or in the cloud, check on or collect dispatched work, or move running work to the cloud before closing the laptop ("dispatch these", "run this in the cloud", "how are my sessions doing", "I have to leave, hand it off").
-argument-hint: "<tasks> | status | sessions | adopt <id> | envs | collect | review <name> | fix <name> | handoff"
+argument-hint: "<tasks> | status | sessions | adopt <id> | pull <name|id> | envs | collect | review <name> | fix <name> | handoff"
 ---
 
 # dispatch
@@ -23,6 +23,7 @@ python3 $D status [--repo <dir>]
 python3 $D envs   [--json]
 python3 $D sessions [--all] [--limit <n>] [--json]
 python3 $D adopt  <session id> --name <name> --repo <dir> [--brief-file <file>]
+python3 $D pull   <name|session id> [--out <dir>] [--into-existing]
 python3 $D result <name>
 python3 $D clean  <name>
 python3 $D forget <name>
@@ -41,13 +42,19 @@ It keeps its state in `~/.claude/dispatch/` (task list, briefs, reports), never 
 2. **Choose where each runs.**
    - **Local** is the default. A local session has the machine's files, credentials,
      signed-in tools and network.
-   - **Cloud** only when all of these hold: the repo has a GitHub remote, the Claude
-     GitHub App is installed on that repo with write access, the work the task depends
-     on is pushed, and the task needs nothing that exists only on this machine (secrets,
-     a cluster or VPN, a signed-in browser, local media, hardware). The helper cannot
-     check the app: for a repo that has never had a cloud task come back, ask the user
-     to confirm it first (https://github.com/apps/claude/installations/select_target).
-     Choose it for long work, or when the user says they will close the laptop.
+   - **Cloud** only when the task needs nothing that exists only on this machine
+     (secrets, a cluster or VPN, a signed-in browser, hardware). Choose it for long
+     work, or when the user says they will close the laptop. Two ways:
+     - *Through GitHub* (the repo has a GitHub remote): the session clones it and its
+       work comes back as a pull request. Needs the work pushed and the Claude GitHub
+       App on the repo with write access. The helper cannot check the app: for a repo
+       that has never had a cloud task come back, ask the user to confirm it first
+       (https://github.com/apps/claude/installations/select_target).
+     - *Uploaded* (no GitHub remote): `claude --cloud` uploads the folder's committed
+       history itself, and the work comes back with `pull`: the session is told to
+       send every file it changed. No pull request, no branch, no `review` (there is
+       no diff to review; `pull` and compare instead). Commit first: uncommitted
+       changes may not be uploaded.
    - Pass `--needs-local` for a local task that could never move to the cloud. `handoff`
      relies on it.
 3. **Write a brief** for each task to a temporary file. The session knows nothing about
@@ -73,7 +80,7 @@ branch and opens a pull request, because that is the only way its work comes bac
 | It says | Do |
 |---|---|
 | not a trusted folder | Tell the user to run `claude` in that folder once and accept the prompt. Never accept it for them. |
-| no GitHub remote / local_only | Run the task with `local`. |
+| local_only | Run the task with `local`. |
 | uncommitted or unpushed work | Ask the user whether to push first. `--allow-unpushed` only if the task does not depend on that work. |
 | limit reached | Tell the user what is running; start the rest later. |
 
@@ -98,6 +105,8 @@ with the CLI's own login), and the note is the session's own one-line status:
 - `pr-open` / `draft` / `branch-pushed`: work reached GitHub, but without a report.
 - `failed` / `blocked`: the session stopped and says why (an API error, a question).
   Pass that on; do not start it again without asking.
+- An uploaded task (no GitHub) shows `done` with `pull <name>` in its note when the
+  session finished: run `pull` and show the user `PULLED.md`.
 - `not-pushed`: the session stopped and nothing is on GitHub. Usually the push failed:
   without the Claude GitHub App on the repo, a cloud session does the work and then has
   no way to send it back. The user installs the app and tells that session, in the
@@ -129,6 +138,29 @@ the session was asked: when the user can say it, write that to a file and pass
 
 To bring a session's conversation and branch to this machine, the user runs
 `claude --teleport <id>` in that checkout. It is interactive, so never run it yourself.
+Teleport gets the code only from GitHub (`git fetch` of the session's branch): for a
+session that never pushed, it brings the conversation and none of the files.
+
+## `/dispatch pull <name|id>`
+
+Brings a cloud session's files to this machine from its history, with no GitHub: for a
+session started from a folder with no GitHub remote, or one that could not push. Into
+`~/claude-cloud/<name>/` unless `--out` says otherwise; it refuses a folder that is not
+empty unless `--into-existing`. It reads the session's events (the API claude.ai uses)
+and writes:
+
+- **sent**: each file the session sent with SendUserFile (videos, images, archives),
+  downloaded byte for byte.
+- **rebuilt**: each file its Write and Edit calls left, as text. An edit of a file the
+  session did not write (one from the upload or the clone) starts from the text the
+  edit's result records.
+
+Files that commands made (a build, a render, `cp`, `git checkout`) are not in the history
+and are not pulled. `PULLED.md` in the folder lists what came and what was skipped. Show
+the user that list. When something they need is missing, the session can send it: they
+tell it, in the browser, to send those files with SendUserFile, then `pull` again with
+`--into-existing`. The pulled folder is a copy, not a checkout: never copy it over a
+repository without asking.
 
 ## `/dispatch envs`
 
@@ -316,7 +348,8 @@ prints the command).
   user, and push first or use `--no-worktree`.
   The helper lists `.claude/worktrees/` in the repo's `.git/info/exclude`, so the
   worktrees do not show up in `git status`.
-- A cloud session works on a clone from GitHub. It never sees local files or secrets.
+- A cloud session works on a clone from GitHub, or on the uploaded folder. It never
+  sees local files outside it, or secrets.
   It runs on the config's `cloud_environment`, or on the one given with
   `--environment` for that task (`envs` lists them). The environment's setup script runs before every
   task, so a heavy one delays them all: pick the lightest environment that has what the

@@ -11,7 +11,7 @@ Standard library only. State lives in ~/.claude/dispatch/ (never in a repo):
 A review is a local task named <name>-review: a new session that did not write the
 change reads the finished task's branch and reports a verdict.
 
-Commands: local, cloud, review, fix, wait, status, envs, sessions, adopt, result, clean, forget. Run with -h for flags.
+Commands: local, cloud, review, fix, wait, status, envs, sessions, adopt, pull, result, clean, forget. Run with -h for flags.
 """
 
 import argparse
@@ -101,6 +101,25 @@ owner must do (usually: install the Claude GitHub App on the repository with wri
 access), then stop. The owner can then tell this session to push again.
 """
 
+UPLOAD_PUSH = "- This folder came from the owner's computer and has no GitHub remote. Do not push anywhere."
+
+UPLOAD_REPORT = """\
+## Reporting (required, last step)
+
+Your work cannot leave this machine through git: the owner copies it back from this
+conversation. So, as the last step:
+
+1. Send every file you created or changed with the SendUserFile tool, under the same
+   paths. When there are more than 20, put them in one `dispatch-{name}.tar.gz` (with
+   their paths from the folder's root) and send that instead.
+2. End your last message with these lines:
+
+    DISPATCH: {name}
+    STATUS: done | failed | blocked
+    TESTS: <command you ran and whether it passed, or not run and why>
+    SUMMARY: <2 to 5 lines: what changed, what is left, anything the owner must decide>
+"""
+
 RULES_MARK = "## Rules for this dispatched session"
 
 REVIEW = """\
@@ -183,8 +202,8 @@ def load_tasks():
 
 def save_tasks(tasks):
     HOME.mkdir(parents=True, exist_ok=True)
-    for t in tasks:  # "model" and "environment" are only written when one was chosen
-        for k in ("model", "environment"):
+    for t in tasks:  # these are only written when they hold something
+        for k in ("model", "environment", "upload"):
             if t.get(k) is None:
                 t.pop(k, None)
     TASKS.write_text("".join(json.dumps(t) + "\n" for t in tasks))
@@ -565,13 +584,16 @@ def cmd_cloud(args):
     args.where = "cloud"
     repo, brief = check_common(args, tasks, cfg)
     remote = git(repo, "remote", "get-url", "origin")
-    if "github.com" not in remote:
-        die(f"{repo.name} has no GitHub remote; a cloud session cannot see it. Run it locally.", 4)
+    upload = "github.com" not in remote  # claude --cloud uploads the folder itself
     if any(repo.name == n or str(repo).endswith(n) for n in cfg.get("local_only", [])):
         die(f"{repo.name} is listed as local_only in {CONFIG}. Run it locally.", 4)
     dirty = git(repo, "status", "--porcelain")
-    ahead = git(repo, "log", "--oneline", "@{u}..HEAD")
-    if (dirty or ahead) and not args.allow_unpushed:
+    ahead = "" if upload else git(repo, "log", "--oneline", "@{u}..HEAD")
+    if upload and dirty and not args.allow_unpushed:
+        die("the folder has uncommitted changes. Without GitHub, claude --cloud uploads the "
+            "folder's git history, and those changes may not go with it. Commit first, or "
+            "pass --allow-unpushed if the task does not depend on them.", 5)
+    if not upload and (dirty or ahead) and not args.allow_unpushed:
         die("the repo has "
             + ("uncommitted changes" if dirty else "")
             + (" and " if dirty and ahead else "")
@@ -580,12 +602,19 @@ def cmd_cloud(args):
               "--allow-unpushed if the task does not depend on them.", 5)
     branch = f"dispatch/{args.name}"
     base = args.base or git(repo, "branch", "--show-current") or "the default branch"
-    full = "\n\n".join([
-        brief,
-        f"Start from the branch `{base}`.",
-        RULES.format(branch=branch, extra=cfg.get("extra_rules", ""), push=CLOUD_PUSH),
-        CLOUD_REPORT.format(branch=branch, name=args.name),
-    ])
+    if upload:
+        full = "\n\n".join([
+            brief,
+            RULES.format(branch=branch, extra=cfg.get("extra_rules", ""), push=UPLOAD_PUSH),
+            UPLOAD_REPORT.format(name=args.name),
+        ])
+    else:
+        full = "\n\n".join([
+            brief,
+            f"Start from the branch `{base}`.",
+            RULES.format(branch=branch, extra=cfg.get("extra_rules", ""), push=CLOUD_PUSH),
+            CLOUD_REPORT.format(branch=branch, name=args.name),
+        ])
     BRIEFS.mkdir(parents=True, exist_ok=True)
     (BRIEFS / f"{args.name}.md").write_text(full + "\n")
 
@@ -602,13 +631,15 @@ def cmd_cloud(args):
     url = re.search(r"https://claude\.ai/code/\S+", out)
     task = {
         "name": args.name, "where": "cloud", "model": model, "environment": env_id,
-        "id": m.group(1), "repo": str(repo),
-        "branch": branch, "base": args.base or git(repo, "branch", "--show-current") or None,
+        "id": m.group(1), "repo": str(repo), "upload": upload or None,
+        "branch": None if upload else branch,
+        "base": None if upload else (args.base or git(repo, "branch", "--show-current") or None),
         "url": url.group(0).split("?")[0] if url else None,
         "started": int(time.time()),
     }
     save_tasks(tasks + [task])
-    print(f"started cloud {args.name} id={task['id']} repo={repo.name} branch={branch}"
+    print(f"started cloud {args.name} id={task['id']} repo={repo.name} "
+          + ("uploaded (no GitHub; `pull` brings the work back)" if upload else f"branch={branch}")
           + (f" model={model}" if model else "")
           + f" environment={env_name or 'account default'}")
     print(f"view: {task['url']}")
@@ -620,6 +651,9 @@ def resolves(repo, ref):
 
 def review_range(t, repo):
     """The two commits a review compares: where the task's branch left its base, and its tip."""
+    if t.get("upload"):
+        die(f"{t['name']} ran on an uploaded folder with no GitHub branch, so there is no diff "
+            f"to review. `pull {t['name']}` brings its files; compare them with the folder.")
     if not t.get("branch"):
         die(f"{t['name']} has no branch "
             + ("(claude.ai names none for this session yet)" if t["where"] == "cloud"
@@ -898,6 +932,21 @@ def cloud_state(t, cs=None):
     repo, url = t["repo"], t.get("url") or ""
     s = (cs or CloudSessions()).get(t["id"])
     f = session_facts(s) if isinstance(s, dict) else None
+    if t.get("upload"):  # no GitHub: only claude.ai knows, and `pull` brings the work
+        if s == GONE:
+            return "gone", "claude.ai no longer has this session; its work cannot be pulled"
+        if not f:
+            return "running-or-no-output", url
+        line = f["line"] or f["recent"]
+        if f["worker"] == "running":
+            return "running", line
+        if f["worker"] == "requires_action":
+            return "waiting-for-you", f"{f['needs'] or line or 'it waits for an answer'}; open {url}"
+        if f["category"] == "failed":
+            return "failed", f"{line}; open {url}"
+        if f["category"] in ("blocked", "waiting"):
+            return "blocked", f"{f['needs'] or line}; open {url}"
+        return "done", f"{line}; `pull {t['name']}` brings its files"
     pr = cloud_pr(t, f and f["branch"])
     if pr:
         m = re.search(r"STATUS:\s*(\w+)", pr.get("body") or "")
@@ -1171,6 +1220,143 @@ def cmd_adopt(args):
           " (no brief: `review` needs one, pass --brief-file)"))
 
 
+def session_events(sid, token, org):
+    """Every event of a cloud session, oldest first (the history claude.ai shows)."""
+    cse = "cse_" + sid[len("session_"):] if sid.startswith("session_") else sid
+    found, cursor = [], None
+    for _ in range(400):
+        q = "?limit=500&sort_order=desc" + (f"&cursor={urllib.parse.quote(cursor)}" if cursor else "")
+        page = api_get(f"/v1/code/sessions/{urllib.parse.quote(cse)}/events" + q, token, org)
+        rows = page.get("data") or []
+        found += rows
+        cursor = page.get("next_cursor")
+        if not rows or not cursor:
+            break
+    return [e.get("payload") or {} for e in reversed(found)]
+
+
+def session_files(events):
+    """What a session's history holds of its files, in the order it made them.
+
+    Gives (sent, written, skipped): `sent` maps a path to the file_uuid of a file the
+    session sent with SendUserFile (the real bytes, downloadable); `written` maps a
+    path to its text as the session's Write and Edit calls left it (an Edit starts from
+    the file as it was before, which its result records); `skipped` lists paths and why.
+    Files that commands made (builds, renders, `cp`) are in neither: the history only
+    shows that the command ran.
+    """
+    uses, results = {}, {}
+    for p in events:
+        content = (p.get("message") or {}).get("content")
+        for b in content if isinstance(content, list) else []:
+            if b.get("type") == "tool_use":
+                uses[b.get("id")] = b
+            elif b.get("type") == "tool_result":
+                results[b.get("tool_use_id")] = (b.get("is_error") is True, p.get("tool_use_result"))
+    sent, written, skipped = {}, {}, []
+    for uid, use in uses.items():
+        err, tur = results.get(uid, (True, None))
+        if err:
+            continue  # refused or failed: it changed nothing
+        name, inp = use.get("name"), use.get("input") or {}
+        tur = tur if isinstance(tur, dict) else {}
+        if name == "SendUserFile":
+            for a in tur.get("attachments") or []:
+                if a.get("file_uuid") and a.get("path"):
+                    sent[a["path"]] = {"uuid": a["file_uuid"], "size": a.get("size")}
+        elif name == "Write" and isinstance(inp.get("content"), str):
+            written[inp.get("file_path")] = inp["content"]
+        elif name == "Edit" and inp.get("file_path"):
+            path = inp["file_path"]
+            base = written.get(path, tur.get("originalFile"))
+            old, new = inp.get("old_string"), inp.get("new_string")
+            if not isinstance(base, str) or not isinstance(old, str) or old not in base:
+                skipped.append((path, "an edit whose starting text is not in the history"))
+                written.pop(path, None)
+                continue
+            written[path] = base.replace(old, new) if inp.get("replace_all") else base.replace(old, new, 1)
+    return sent, written, skipped
+
+
+def local_path(out, path):
+    """Where a path of the cloud machine goes under `out`, or None if it would leave it."""
+    rel = path[len("/home/user/"):] if path.startswith("/home/user/") else path.lstrip("/")
+    target = (out / rel).resolve()
+    return target if target.is_relative_to(out.resolve()) and rel else None
+
+
+def download(uuid, token, org, target, size=None):
+    """Save a file the session sent (claude.ai's files route) to target; True when whole."""
+    url = os.environ.get("DISPATCH_API_URL", "https://api.anthropic.com")
+    req = urllib.request.Request(f"{url}/api/oauth/files/{urllib.parse.quote(uuid)}/content", headers={
+        "Authorization": f"Bearer {token}", "x-organization-uuid": org,
+        "anthropic-version": "2023-06-01"})
+    target.parent.mkdir(parents=True, exist_ok=True)
+    part = target.with_name(target.name + ".part")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+    except (urllib.error.URLError, TimeoutError, OSError):
+        part.unlink(missing_ok=True)
+        return False
+    if size is not None and part.stat().st_size != size:
+        part.unlink(missing_ok=True)
+        return False
+    part.replace(target)
+    return True
+
+
+def cmd_pull(args):
+    """Bring a cloud session's files to this machine from its history, without GitHub."""
+    t = next((t for t in load_tasks() if t["name"] == args.target), None)
+    sid = session_id(t["id"] if t else args.target)
+    if not t and not sid.startswith("session_"):
+        die(f"no task named {args.target}, and it is not a session id; `sessions` lists them")
+    if t and t["where"] != "cloud":
+        die(f"{args.target} is a local task; its work is already on this machine")
+    label = t["name"] if t else sid
+    out = Path(args.out or Path.home() / "claude-cloud" / label).expanduser()
+    if out.exists() and any(out.iterdir()) and not args.into_existing:
+        die(f"{out} is not empty. Choose another --out, or pass --into-existing to add to it "
+            "(files of the same name are replaced).")
+    token, org = claude_login()
+    if CloudSessions().get(sid) == GONE:
+        die(f"claude.ai has no session {sid}")
+    print(f"reading the history of {sid} ...", flush=True)
+    sent, written, skipped = session_files(session_events(sid, token, org))
+    print(f"{len(sent)} sent file{'s' if len(sent) != 1 else ''} to download, "
+          f"{len(written)} written file{'s' if len(written) != 1 else ''} to rebuild", flush=True)
+    out.mkdir(parents=True, exist_ok=True)
+    lines, failed = [], 0
+    for path, f in sent.items():
+        target = local_path(out, path)
+        ok = target is not None and download(f["uuid"], token, org, target, f.get("size"))
+        failed += not ok
+        lines.append(f"{'sent' if ok else 'FAILED'}  {path}" + (f"  ({f.get('size')} bytes)" if f.get("size") else ""))
+        print("  " + lines[-1], flush=True)
+    for path, text in written.items():
+        if path in sent:
+            continue  # the real bytes win over a rebuilt text
+        target = local_path(out, path)
+        if target is None:
+            skipped.append((path, "it would land outside the folder"))
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+        lines.append(f"rebuilt  {path}")
+    lines += [f"skipped  {p}: {why}" for p, why in skipped]
+    note = ("Pulled from the history of " + sid + " (https://claude.ai/code/" + sid + ").\n"
+            "sent: the file the session sent, byte for byte. rebuilt: the text its Write and "
+            "Edit calls left. Files that commands made (builds, renders, copies) are not in the "
+            "history; ask the session to send them with SendUserFile, then pull again.\n\n")
+    (out / "PULLED.md").write_text(note + "\n".join(lines) + "\n")
+    print(f"pulled {len(lines) - len(skipped) - failed} file{'s' if len(lines) - len(skipped) - failed != 1 else ''} "
+          f"of {label} into {out}" + (f"; {failed} download{'s' if failed != 1 else ''} failed" if failed else "")
+          + (f"; {len(skipped)} skipped" if skipped else "") + " (list in PULLED.md)")
+    if failed:
+        sys.exit(6)
+
+
 def cmd_envs(args):
     """One line per cloud environment: name, id, kind, state, and its role in the config."""
     cfg = load_config()
@@ -1237,6 +1423,11 @@ def main():
     s.add_argument("name", help="the task (not its review or an earlier fix)")
     s.add_argument("--model", help="model for the new round")
     s.set_defaults(fn=cmd_fix)
+    s = sub.add_parser("pull", help="bring a cloud session's files here from its history (no GitHub needed)")
+    s.add_argument("target", help="a cloud task's name, or a session id")
+    s.add_argument("--out", help="folder to put them in (default ~/claude-cloud/<name>)")
+    s.add_argument("--into-existing", action="store_true", help="add to a folder that is not empty")
+    s.set_defaults(fn=cmd_pull)
     s = sub.add_parser("sessions", help="list the account's cloud sessions (what teleport lists)")
     s.add_argument("--all", action="store_true", help="archived sessions too")
     s.add_argument("--limit", type=int, default=30, help="at most this many (default 30)")

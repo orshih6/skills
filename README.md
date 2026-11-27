@@ -32,6 +32,9 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
 - **`sessions`** lists every cloud session on your account, as `claude --teleport` does,
   and **`adopt <id>`** makes dispatch track one it did not start, so `status`, `wait`,
   `result` and `review` work on it too.
+- **`pull <name|id>`** brings a cloud session's files to your machine from its history,
+  with no GitHub: the files it sent (byte for byte) and the files it wrote or edited.
+  Teleport cannot do this for a session that never pushed: it fetches code from GitHub.
 - **`envs`** lists your cloud environments as claude.ai/code has them (the same list as
   `/remote-env`), with the name your config gives each one. A cloud task can then pick
   one by that claude.ai name: `--environment "Light"`. It uses the claude CLI's

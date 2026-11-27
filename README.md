@@ -1,57 +1,43 @@
-# Personal Skills
+# skills
 
-A collection of personal Claude Code skills — reusable slash commands that automate multi-step workflows directly inside your Claude Code session.
+General-purpose [Claude Code](https://claude.com/claude-code) skills. Each one is a
+directory under `skills/` with a `SKILL.md` that Claude loads when you type
+`/<skill-name>` or ask for what it describes.
 
-## What are skills?
+| Skill | What it does |
+|---|---|
+| [dispatch](skills/dispatch/SKILL.md) | Run tasks in other Claude Code sessions (local background or cloud) and manage them from one session, so the work does not fill that session's context. Move running work to the cloud before you close the laptop. |
 
-Skills are custom slash commands for [Claude Code](https://claude.ai/code). Each skill lives in its own directory under `skills/` and contains a `SKILL.md` file that tells Claude how to execute a specific workflow when you type `/skill-name`.
+## dispatch
 
-Skills can include reference documents, scripts, and any other supporting files the workflow needs.
+```
+/dispatch fix the flaky login test; add CSV export to the reports page
+/dispatch status
+/dispatch collect
+/dispatch handoff
+```
 
-## Skills catalog
+- **`/dispatch <tasks>`** writes a self-contained brief for each task and starts one
+  session per task: `claude --bg` in its own git worktree, or `claude --cloud` when the
+  repo is on GitHub and the task needs nothing from your machine.
+- **`status`** shows one line per task. **`collect`** gives each finished task's result
+  in a few lines.
+- **`handoff`** is for when you have to leave: tasks that can run in the cloud are pushed
+  to a branch and continued there; the rest are listed with how to keep them running.
 
-| Skill | Command | Description |
-|-------|---------|-------------|
-| [apply-to-job](skills/apply-to-job/SKILL.md) | `/apply-to-job <job_url> <cv_url>` | Full pipeline: research company, verify legitimacy, find contact email, draft cold outreach |
+Every dispatched session works on its own branch and is told never to push the default
+branch, merge, deploy, spend money or message anyone. It reports in a fixed shape that
+the manager reads instead of the session's log.
 
-## Installation
+Needs Claude Code 2.1 or newer (`claude --bg`, `claude --cloud`), `git`, Python 3, and
+`gh` for reading cloud results. State is kept in `~/.claude/dispatch/`.
 
-### Prerequisites
-
-- [Claude Code](https://claude.ai/code) installed and authenticated
-
-### Install all skills
-
-Clone this repo into your Claude Code user skills directory:
+## Install
 
 ```bash
-git clone <this-repo-url> ~/.claude/skills/personal
+git clone https://github.com/orshih6/skills.git
+ln -s "$PWD/skills/skills/dispatch" ~/.claude/skills/dispatch
 ```
 
-Claude Code will automatically discover skills placed under `~/.claude/skills/`.
-
-### Install a single skill
-
-Copy the skill directory into your user skills folder:
-
-```bash
-cp -r skills/apply-to-job ~/.claude/skills/
-```
-
-### Project-scoped install
-
-To make skills available only within a specific project, copy the `skills/` directory into that project's `.claude/` folder:
-
-```bash
-cp -r skills/apply-to-job /path/to/project/.claude/skills/
-```
-
-## Usage
-
-After installation, type the command in any Claude Code session:
-
-```
-/apply-to-job https://jobs.lever.co/stripe/1234 https://myportfolio.com/cv
-```
-
-Run `/help` inside Claude Code to see all available skills.
+Or copy a single skill directory into `~/.claude/skills/` (all your projects) or into a
+project's `.claude/skills/` (that project only).

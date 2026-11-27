@@ -11,7 +11,7 @@ Standard library only. State lives in ~/.claude/dispatch/ (never in a repo):
 A review is a local task named <name>-review: a new session that did not write the
 change reads the finished task's branch and reports a verdict.
 
-Commands: local, cloud, review, wait, status, envs, result, clean, forget. Run with -h for flags.
+Commands: local, cloud, review, wait, status, envs, sessions, adopt, result, clean, forget. Run with -h for flags.
 """
 
 import argparse
@@ -621,7 +621,9 @@ def resolves(repo, ref):
 def review_range(t, repo):
     """The two commits a review compares: where the task's branch left its base, and its tip."""
     if not t.get("branch"):
-        die(f"{t['name']} has no branch (its folder is not a git repository); there is nothing to diff")
+        die(f"{t['name']} has no branch "
+            + ("(claude.ai names none for this session yet)" if t["where"] == "cloud"
+               else "(its folder is not a git repository)") + "; there is nothing to diff")
     cloud = t["where"] == "cloud"
     if cloud:
         s = CloudSessions().get(t["id"])
@@ -667,7 +669,9 @@ def cmd_review(args):
     bf = BRIEFS / f"{args.name}.md"
     brief = bf.read_text().split(RULES_MARK)[0].strip() if bf.exists() else ""
     if not brief:
-        die(f"the brief of {args.name} is missing ({bf}); a review needs to know what was asked")
+        die(f"the brief of {args.name} is missing ({bf}); a review needs to know what was asked"
+            + (". Write what the session was asked to a file and `adopt` it again with "
+               "--brief-file (forget it first)" if t.get("adopted") else ""))
     extra = cfg.get("extra_rules", "")
     result = RESULTS / f"{name}.md"
     full = REVIEW.format(brief=brief, base=base, ref=ref, result=result,
@@ -935,6 +939,113 @@ def cmd_forget(args):
     print(f"forgot {args.name} (the session, its branch and its report file are untouched)")
 
 
+def session_id(sid):
+    """The id as `claude --teleport` and claude.ai links take it: session_..., not cse_..."""
+    return "session_" + sid[len("cse_"):] if sid.startswith("cse_") else sid
+
+
+def session_repo(s):
+    """owner/name of the GitHub repository a cloud session works on, or None."""
+    for src in (s.get("config") or {}).get("sources") or []:
+        m = re.search(r"github\.com[/:]([^/]+/[^/]+?)(?:\.git)?/?$", src.get("url") or "")
+        if src.get("type") == "git_repository" and m:
+            return m.group(1)
+    return None
+
+
+def session_word(s):
+    """One word for a cloud session's state, from what claude.ai says."""
+    f = session_facts(s)
+    if f["archived"]:
+        return "archived"
+    if f["worker"] == "running":
+        return "running"
+    if f["worker"] == "requires_action":
+        return "waiting-for-you"
+    return f["category"] or f["worker"] or "unknown"
+
+
+def cmd_sessions(args):
+    """Every cloud session of the account, newest first: the list `claude --teleport` shows."""
+    token, org = claude_login()
+    found, cursor = [], None
+    for _ in range(20):
+        q = "?limit=50" + (f"&cursor={urllib.parse.quote(cursor)}" if cursor else "")
+        page = api_get("/v1/code/sessions" + q, token, org)
+        rows = page.get("data") or []
+        found += [r for r in rows if args.all or r.get("status") != "archived"]
+        cursor = page.get("next_cursor")
+        if len(found) >= args.limit or not rows or not cursor:
+            break
+    found = found[:args.limit]
+    if args.json:
+        print(json.dumps(found, indent=2))
+        return
+    if not found:
+        print("no cloud sessions" + ("" if args.all else " (--all also lists archived ones)"))
+        return
+    mine = {t["id"]: t["name"] for t in load_tasks() if t["where"] == "cloud"}
+    for r in found:
+        sid = session_id(r.get("id", ""))
+        f = session_facts(r)
+        when = (r.get("last_event_at") or r.get("created_at") or "")[:16].replace("T", " ")
+        title = " ".join((r.get("title") or "untitled").split())[:40]
+        tag = f"  (dispatch: {mine[sid]})" if sid in mine else ""
+        print(f"{sid}  {session_word(r):<15} {when}  {session_repo(r) or '-'}  {title!r}"
+              f"{tag}  {f['line'][:80]}")
+
+
+def cmd_adopt(args):
+    """Track a cloud session that dispatch did not start, like one it did."""
+    tasks = load_tasks()
+    if not NAME_OK.match(args.name):
+        die("name must be lowercase letters, digits and dashes (2 to 41 characters)")
+    if any(t["name"] == args.name for t in tasks):
+        die(f"a task named {args.name} already exists; pick another name or `forget` it")
+    sid = session_id(args.session)
+    if not sid.startswith("session_"):
+        die("give the session's id (session_... or cse_...); `sessions` lists them")
+    had = next((t["name"] for t in tasks if t["id"] == sid), None)
+    if had:
+        die(f"{sid} is already the task {had}")
+    s = CloudSessions().get(sid)
+    if s == GONE:
+        die(f"claude.ai has no session {sid}; `sessions` lists them")
+    if not isinstance(s, dict):
+        die("could not read the session from claude.ai; is the claude CLI signed in?", 6)
+    repo = Path(args.repo).expanduser().resolve()
+    want = session_repo(s)
+    have = re.search(r"github\.com[/:]([^/]+/[^/]+?)(?:\.git)?/?$", git(repo, "remote", "get-url", "origin"))
+    if not want:
+        die(f"{sid} works on no GitHub repository; there is nothing dispatch can follow")
+    if not have or have.group(1).lower() != want.lower():
+        die(f"{sid} works on {want}, but {repo} is "
+            + (f"a checkout of {have.group(1)}" if have else "not a GitHub checkout")
+            + ". Give --repo a checkout of " + want)
+    f = session_facts(s)
+    outcome = [b for o in (s.get("config") or {}).get("outcomes") or []
+               for b in (o.get("git_info") or {}).get("branches") or []]
+    branch = f["branch"] or (outcome[0] if outcome else None)
+    base = next((src.get("revision") for src in (s.get("config") or {}).get("sources") or []
+                 if src.get("revision")), None)
+    if args.brief_file:
+        brief = Path(args.brief_file).read_text().strip()
+        if not brief:
+            die("the brief is empty")
+        BRIEFS.mkdir(parents=True, exist_ok=True)
+        (BRIEFS / f"{args.name}.md").write_text(brief + "\n")
+    task = {
+        "name": args.name, "where": "cloud", "adopted": True, "id": sid, "repo": str(repo),
+        "branch": branch, "base": base, "environment": s.get("environment_id"),
+        "url": f"https://claude.ai/code/{sid}",
+        "started": int(time.time()),
+    }
+    save_tasks(tasks + [task])
+    print(f"adopted {sid} as {args.name} repo={repo.name} branch={branch or 'none yet'} "
+          f"state={session_word(s)}" + ("" if args.brief_file else
+          " (no brief: `review` needs one, pass --brief-file)"))
+
+
 def cmd_envs(args):
     """One line per cloud environment: name, id, kind, state, and its role in the config."""
     cfg = load_config()
@@ -997,6 +1108,17 @@ def main():
     s = sub.add_parser("envs", help="list the account's cloud environments (claude.ai/code)")
     s.add_argument("--json", action="store_true", help="print them as JSON")
     s.set_defaults(fn=cmd_envs)
+    s = sub.add_parser("sessions", help="list the account's cloud sessions (what teleport lists)")
+    s.add_argument("--all", action="store_true", help="archived sessions too")
+    s.add_argument("--limit", type=int, default=30, help="at most this many (default 30)")
+    s.add_argument("--json", action="store_true", help="print them as JSON")
+    s.set_defaults(fn=cmd_sessions)
+    s = sub.add_parser("adopt", help="track a cloud session that dispatch did not start")
+    s.add_argument("session", help="its id, session_... or cse_... (`sessions` lists them)")
+    s.add_argument("--name", required=True, help="short unique task name")
+    s.add_argument("--repo", required=True, help="a local checkout of the session's repository")
+    s.add_argument("--brief-file", help="what the session was asked to do (a review needs it)")
+    s.set_defaults(fn=cmd_adopt)
     for name, fn, text in (
         ("review", cmd_review, "start a new session that reviews a finished task's branch"),
         ("result", cmd_result, "print a task's report"),

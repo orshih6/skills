@@ -1,7 +1,7 @@
 ---
 name: dispatch
 description: Run tasks in other Claude Code sessions (local background sessions or cloud sessions) and manage them from this one, so the work does not fill this session's context. Use when the user wants to dispatch, delegate or fan out tasks to separate sessions, run something in the background or in the cloud, check on or collect dispatched work, or move running work to the cloud before closing the laptop ("dispatch these", "run this in the cloud", "how are my sessions doing", "I have to leave, hand it off").
-argument-hint: "<tasks> | status | envs | collect | review <name> | handoff"
+argument-hint: "<tasks> | status | sessions | adopt <id> | envs | collect | review <name> | handoff"
 ---
 
 # dispatch
@@ -20,6 +20,8 @@ python3 $D review <name> [--model <id>]
 python3 $D wait   [<name> ...] [--timeout <seconds>]   # local and cloud tasks
 python3 $D status [--repo <dir>]
 python3 $D envs   [--json]
+python3 $D sessions [--all] [--limit <n>] [--json]
+python3 $D adopt  <session id> --name <name> --repo <dir> [--brief-file <file>]
 python3 $D result <name>
 python3 $D clean  <name>
 python3 $D forget <name>
@@ -109,6 +111,23 @@ with the CLI's own login), and the note is the session's own one-line status:
 it is on, whether it holds unpushed work, and what it has cost. The API has no
 documentation, so a Claude Code update can change it; the helper then falls back to
 GitHub only and says so.
+
+## `/dispatch sessions` and `/dispatch adopt <id>`
+
+`sessions` lists every cloud session of the account, newest first: the list
+`claude --teleport` shows, including sessions started on claude.ai or by another tool.
+Archived ones only with `--all`. Each line: id, state, last activity, repository, title,
+`(dispatch: <name>)` when dispatch already tracks it, and the session's status line.
+Show it as a table.
+
+`adopt` makes dispatch track one of them like a task it started, so `status`, `wait`,
+`result`, `review` and `forget` work on it. `--repo` must be a local checkout of the
+session's GitHub repository (the helper refuses another one). A review needs to know what
+the session was asked: when the user can say it, write that to a file and pass
+`--brief-file`; otherwise adopt without it and say that `review` will refuse.
+
+To bring a session's conversation and branch to this machine, the user runs
+`claude --teleport <id>` in that checkout. It is interactive, so never run it yourself.
 
 ## `/dispatch envs`
 

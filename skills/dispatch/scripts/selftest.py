@@ -748,6 +748,12 @@ def fake_api(seen, sessions=None):
                 body, code = {"error": "unauthorized"}, 401
             elif u.path == "/v1/environment_providers":
                 body, code = ENV_PAGES[parse_qs(u.query).get("after_id", [None])[0]], 200
+            elif u.path == "/v1/code/sessions" and sessions is not None:
+                rows = sorted(sessions.values(), key=lambda x: x["id"])
+                cur = int(parse_qs(u.query).get("cursor", ["0"])[0])
+                more = cur + 2 < len(rows)  # two to a page, so paging is exercised
+                body, code = {"data": rows[cur:cur + 2],
+                              "next_cursor": str(cur + 2) if more else None}, 200
             elif u.path.startswith("/v1/code/sessions/") and sessions is not None:
                 found = sessions.get(u.path.rsplit("/", 1)[1])
                 body, code = ({"response_shape": found}, 200) if found else ({"error": "not found"}, 404)
@@ -922,6 +928,62 @@ def cloud_checks(e):
         rows, out = e.status(("wait", "run"))
         expect(time.time() - t0 < 8, "wait slept although the cloud session is idle")
         expect("still running" not in out, f"wait reports an idle cloud session as running: {out!r}")
+    finally:
+        srv.shutdown()
+
+
+@check("cloud: sessions lists the account's sessions, adopt tracks one")
+def adopt_checks(e):
+    live = {}
+    srv = fake_api([], live)
+    try:
+        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"):
+            e.env.pop(k, None)
+        e.env["DISPATCH_API_URL"] = f"http://127.0.0.1:{srv.server_address[1]}"
+        (e.dir / ".claude").mkdir()
+        (e.dir / ".claude" / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "tok-123", "expiresAt": int(time.time() + 3600) * 1000}}))
+        (e.dir / ".claude.json").write_text(json.dumps({"oauthAccount": {"organizationUuid": "org-9"}}))
+        src = {"sources": [{"type": "git_repository", "url": "https://github.com/acme/shop",
+                            "revision": "main"}]}
+        for i, (worker, cat, title) in enumerate((("running", "", "Price column"),
+                                                  ("idle", "completed", "Fix login"),
+                                                  ("idle", "failed", "Old idea"))):
+            row = cloud_session(f"cse_0{i + 1}", worker, cat, line=f"line {i + 1}",
+                                branch="claude/price" if i == 0 else None)
+            row.update(title=title, config=src, created_at="2026-11-27T08:00:00Z")
+            live[row["id"]] = row
+        live["cse_03"]["status"] = "archived"
+
+        r = e.d("sessions")
+        same(r.returncode, 0, f"sessions exit code ({r.stderr.strip()})")
+        lines = r.stdout.splitlines()
+        same([l.split()[0] for l in lines], ["session_01", "session_02"], "sessions, archived left out")
+        has(lines[0], "running", "state of a running session")
+        has(lines[0], "acme/shop  'Price column'", "repository and title")
+        r = e.d("sessions", "--all")
+        same(len(r.stdout.splitlines()), 3, "sessions --all, over two pages")
+        has(r.stdout.splitlines()[2], "archived", "an archived session")
+
+        e.git("remote", "add", "origin", "https://github.com/acme/other.git")
+        refused(e.d("adopt", "cse_01", "--name", "price", "--repo", e.repo),
+                "works on acme/shop", "adopt with a checkout of another repository")
+        e.git("remote", "set-url", "origin", "git@github.com:acme/shop.git")
+        refused(e.d("adopt", "session_09", "--name", "price", "--repo", e.repo),
+                "claude.ai has no session", "adopt of an unknown session")
+        brief = e.dir / "brief.md"
+        brief.write_text(BRIEF + "\n")
+        r = e.d("adopt", "cse_01", "--name", "price", "--repo", e.repo, "--brief-file", brief)
+        same(r.returncode, 0, f"adopt exit code ({r.stderr.strip()})")
+        has(r.stdout, "adopted session_01 as price", "adopt output")
+        t = e.task("price")
+        same((t["where"], t["id"], t["branch"], t["base"], t["url"]),
+             ("cloud", "session_01", "claude/price", "main", "https://claude.ai/code/session_01"),
+             "the adopted task")
+        same(e.brief_of("price"), BRIEF + "\n", "the adopted task's brief")
+        refused(e.d("adopt", "session_01", "--name", "again", "--repo", e.repo),
+                "already the task price", "adopting the same session twice")
+        has(e.d("sessions").stdout.splitlines()[0], "(dispatch: price)", "sessions marks a tracked one")
     finally:
         srv.shutdown()
 

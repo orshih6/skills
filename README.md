@@ -43,7 +43,8 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
   one by that claude.ai name: `--environment "Light"`. It uses the claude CLI's
   own login and an undocumented API, so a Claude Code update may break it.
 - **`collect`** first has each finished task reviewed by a new session that did not
-  write it and has not seen its report, then gives the results in order of risk, with
+  write it and has not seen its report, on a fresh cloud machine by default (this
+  machine when the task needs it), then gives the results in order of risk, with
   the findings the reviewer could confirm. A task whose review confirms a major problem
   goes back to a new session on the same branch with only those findings, and is
   reviewed again, up to `max_fix_rounds` times (default 2). `/dispatch review <name>`

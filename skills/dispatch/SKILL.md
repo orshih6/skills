@@ -16,7 +16,7 @@ Everything goes through one helper:
 D="${CLAUDE_SKILL_DIR}/scripts/dispatch.py"   # scripts/ next to this file
 python3 $D local  --repo <dir> --name <name> --brief-file <file> [--needs-local] [--no-worktree] [--model <id>]
 python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--model <id>] [--environment <name|id>]
-python3 $D review <name> [--model <id>]
+python3 $D review <name> [--local] [--model <id>]
 python3 $D fix    <name> [--model <id>]
 python3 $D wait   [<name> ...] [--timeout <seconds>]   # local and cloud tasks
 python3 $D status [--repo <dir>]
@@ -184,14 +184,21 @@ did not write the change checks it.
 1. **Review.** Run `status` to see the tasks (all repos, or `--repo <dir>` when the user
    names one). For each task that reports `done` and has no `<name>-review` task yet,
    run `review <name>`. Treat a `handoff` task as `done` when its report says nothing
-   is left to do. It starts a new local session in its own worktree. That session
-   gets the original brief and the branch's diff, not the writer's report or reasoning.
+   is left to do. It starts a new session that gets the original brief and the
+   branch's diff, not the writer's report or reasoning. It runs **in the cloud by
+   default**: the task's worktree is uploaded to a fresh machine, which also catches
+   work that only runs on this one (a missing dependency, an uncommitted file, an
+   unwritten setup step). It falls back to this machine, and says why, when the task
+   is `needs_local`, its repo is `local_only`, there is no claude.ai login, or the
+   worktree is gone. `--local` forces this machine. The start line says where.
    It marks each finding MAJOR (the change misses something the task calls done, or
    breaks something that worked) or MINOR, and CONFIRMED (reproduced, or the failing
    lines are named) or PLAUSIBLE. Do not review tasks that report `failed` or `blocked`, and skip the step
    when the user says so ("collect, no review"). A cloud task has no branch to review:
    `pull` it instead, and report what came back with `PULLED.md`.
-2. **Wait** for the reviews: `wait <name>-review ... --timeout 540`. (`wait` also takes
+2. **Wait** for the reviews: `wait <name>-review ... --timeout 540`. A cloud review's
+   report is fetched when it finishes; `status` and `result` then read it like a
+   local one. (`wait` also takes
    cloud tasks: it waits while claude.ai says the session is running.) It prints the
    status line of every task when the named ones have reported, and starts with a
    `still running after ...` line when the time ran out first. If some reviews are
@@ -298,6 +305,7 @@ prints the command).
 {
   "max_parallel": 4,
   "max_fix_rounds": 2,
+  "review_in_cloud": true,
   "session_prefix": "dispatch-",
   "cloud_model": "claude-opus-5-5",
   "cloud_environment": "light",
@@ -311,6 +319,7 @@ prints the command).
 
 - `max_parallel`: local sessions allowed to run at once (default 4).
 - `max_fix_rounds`: how many times `fix` may send one task back (default 2).
+- `review_in_cloud`: `false` runs every review on this machine (default `true`).
 - `session_prefix`: put before every task name to name its session (default `dispatch-`).
 - `cloud_model`, `local_model`: the model every cloud session, or every local session
   and review, starts on. Without them a session uses the account's default. Pass
@@ -333,7 +342,7 @@ prints the command).
   brief narrow and never dispatch a task whose point is to deploy, pay or send.
 - Sessions cost usage in parallel. Dispatching saves this session's context, not the
   account's limit. Say so if the user dispatches many tasks at once. A review is one
-  more session per task, and it counts towards `max_parallel`.
+  more session per task; a local one counts towards `max_parallel`, a cloud one does not.
 - A review is a second opinion from one session, not a proof. `clean` means it found
   nothing, and a PLAUSIBLE finding may be wrong.
 - A local task gets its own git worktree (`<repo>/.claude/worktrees/<name>`, branch

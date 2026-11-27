@@ -42,7 +42,8 @@ import json, os, shutil, sys
 d = os.environ["FAKE_CLAUDE_DIR"]
 args = sys.argv[1:]
 with open(os.path.join(d, "calls.jsonl"), "a") as f:
-    f.write(json.dumps({"args": args, "cwd": os.getcwd()}) + "\n")
+    f.write(json.dumps({"args": args, "cwd": os.getcwd(),
+                        "force_bundle": os.environ.get("CCR_FORCE_BUNDLE")}) + "\n")
 
 
 def state(name, default):
@@ -60,6 +61,9 @@ elif args[:1] == ["rm"]:
     if target:
         shutil.rmtree(target, ignore_errors=True)
     sys.stdout.write(state("rm_output", "removed\n"))
+elif "--cloud" in args:
+    sid = state("next_cloud_id", "session_07").strip()
+    sys.stdout.write("Created cloud session: x\nView: https://claude.ai/code/%s?from=cli\n" % sid)
 elif "--bg" in args:
     out = state("start_output", None)
     if out is None:
@@ -451,7 +455,8 @@ def review_starts(e):
     e.report("alpha-review", "STATUS: done\nVERDICT: clean\n")
     r = e.reviewed("alpha")
     same(r.stdout.strip(),
-         f"started review alpha-review id=abc12346 repo=shop diff={base[:12]}..worktree-alpha", "output")
+         f"started review alpha-review on this machine id=abc12346 repo=shop diff={base[:12]}..worktree-alpha"
+         " (no folder here has the change checked out to upload)", "output")
     c = e.starts()[-1]
     prompt = c["args"][-1]
     same(c["args"][:-1], ["--bg", "-n", "dispatch-alpha-review", "-w", "alpha-review"], "flags of the start")
@@ -995,6 +1000,7 @@ def cloud_checks(e):
              ("done", "sub added, tests pass; `pull upped` brings its files"), "an uploaded task that finished")
         refused(e.d("review", "upped"), "no GitHub branch", "review of an uploaded task")
         live["cse_07"] = cloud_session("cse_07", "idle")  # created, first turn not ended
+        live["cse_07"]["status_bucket"] = "completed"  # claude.ai can say so before it starts
         rows, _ = e.status()
         same(rows["upped"][1], "starting", "an uploaded task before its first turn ends")
         _, out = e.status(("wait", "upped", "--timeout", "0"))
@@ -1128,6 +1134,81 @@ def pull_checks(e):
         refused(e.d("pull", "session_01", "--out", out), "is not empty", "pull into a full folder")
         r = e.d("pull", "session_01", "--out", out, "--into-existing")
         same(r.returncode, 0, "pull --into-existing")
+    finally:
+        srv.shutdown()
+
+
+@check("review: runs in the cloud on the uploaded worktree, its report comes back")
+def cloud_review_checks(e):
+    report = REVIEW_FINDINGS.encode()
+    live = {}
+    history = {}
+    srv = fake_api([], live, history, {"f-rep": report})
+    try:
+        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"):
+            e.env.pop(k, None)
+        e.env["DISPATCH_API_URL"] = f"http://127.0.0.1:{srv.server_address[1]}"
+        e.started("alpha")
+        e.agents(abc12345="done")
+        tip = e.commit_on("worktree-alpha", "alpha.txt")
+        wt = e.repo / ".claude" / "worktrees" / "alpha"
+        e.git("worktree", "add", "-q", str(wt), "worktree-alpha")
+
+        r = e.d("review", "alpha")  # no claude.ai login: on this machine, and it says why
+        has(r.stdout, "on this machine", "review without a login")
+        has(r.stdout, "no claude.ai login", "the reason")
+        e.d("forget", "alpha-review")
+
+        (e.dir / ".claude").mkdir()
+        (e.dir / ".claude" / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "tok-123", "expiresAt": int(time.time() + 3600) * 1000}}))
+        (e.dir / ".claude.json").write_text(json.dumps({"oauthAccount": {"organizationUuid": "org-9"}}))
+        r = e.d("review", "alpha")
+        same(r.returncode, 0, f"cloud review exit code ({r.stderr.strip()})")
+        has(r.stdout, "started review alpha-review in the cloud id=session_07", "cloud review output")
+        start = [c for c in e.calls() if "--cloud" in c["args"]][-1]
+        same(Path(start["cwd"]).resolve(), wt.resolve(), "the uploaded folder is the task's worktree")
+        same(start["force_bundle"], "1", "uploaded, never cloned from GitHub")
+        has(" ".join(start["args"]), "-n dispatch-alpha-review", "the session's name")
+        prompt = start["args"][start["args"].index("--cloud") + 1]
+        has(prompt, f"git checkout --detach {tip[:12]}", "the review names the tip by its commit")
+        has(prompt, "SendUserFile", "the review is told to send its report")
+        t = e.task("alpha-review")
+        same((t["where"], t["kind"], t["report"]), ("cloud", "review", "dispatch-report-alpha-review.md"),
+             "the review's task line")
+
+        live["cse_07"] = cloud_session("cse_07", "running", line="running the tests")
+        rows, _ = e.status()
+        same(rows["alpha-review"][1:3], ("running", "shop"), "a cloud review at work")
+        live["cse_07"] = cloud_session("cse_07", "idle", "completed", line="review written")
+        history["cse_07"] = [
+            use("s1", "SendUserFile", files=["/home/user/repo/dispatch-report-alpha-review.md"]),
+            res("s1", attachments=[{"file_uuid": "f-rep", "size": len(report),
+                                    "path": "/home/user/repo/dispatch-report-alpha-review.md"}]),
+        ]
+        rows, _ = e.status()
+        same(rows["alpha-review"], ("review", "done", "shop", "findings, risk high, 2 findings (1 major confirmed)"),
+             "a finished cloud review reads like a local one")
+        same(e.d("result", "alpha-review").stdout, REVIEW_FINDINGS + "\n", "result of a cloud review")
+
+        e.d("forget", "alpha-review")  # a review with no file: its last message is used
+        (e.home / "results" / "alpha-review.md").unlink()
+        (e.fake / "next_cloud_id").write_text("session_08")
+        e.d("review", "alpha")
+        live["cse_08"] = cloud_session("cse_08", "idle", "completed")
+        history["cse_08"] = [{"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Done.\n\n" + REVIEW_CLEAN}]}}]
+        rows, _ = e.status()
+        same(rows["alpha-review"][1:], ("done", "shop", "clean, risk low"), "a report read from the last message")
+
+        e.config(review_in_cloud=False)
+        e.d("forget", "alpha-review")
+        r = e.d("review", "alpha")
+        has(r.stdout, "on this machine", "review_in_cloud false")
+        e.d("forget", "alpha-review")
+        e.config()
+        r = e.d("review", "alpha", "--local")
+        has(r.stdout, "on this machine", "review --local")
     finally:
         srv.shutdown()
 

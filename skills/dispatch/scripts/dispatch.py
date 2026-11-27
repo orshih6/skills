@@ -98,6 +98,16 @@ conversation. So, as the last step:
     SUMMARY: <2 to 5 lines: what changed, what is left, anything the owner must decide>
 """
 
+CLOUD_REVIEW_SEND = """
+This machine is a fresh copy, uploaded from the owner's computer: nothing was installed
+on it before you. If the checks cannot run because something is missing that the
+project's own files never mention (a dependency, a setup step, a file that was never
+committed), that is a finding too. Do not push anything anywhere.
+
+After writing the file, send it with the SendUserFile tool: the owner reads your result
+from that file only. Then end your last message with the same text.
+"""
+
 RULES_MARK = "## Rules for this dispatched session"
 
 REVIEW = """\
@@ -119,7 +129,7 @@ The change is `{ref}` compared with `{base}` in this repository:
     git diff --stat {base} {ref}
     git diff {base} {ref}
 
-You are in your own git worktree. `git checkout --detach {ref}` puts the changed code
+{place} `git checkout --detach {ref}` puts the changed code
 in it, so you can run things without touching anyone else's files.
 
 ## How
@@ -410,7 +420,10 @@ def session_facts(s):
     return {
         "archived": s.get("status") == "archived",
         "worker": s.get("worker_status") or "",
-        "category": summary.get("status_category") or s.get("status_bucket") or "",
+        # the session's own end-of-turn summary says how a turn ended; before the first
+        # turn ends there is none, and status_bucket can already read "completed" then
+        "category": summary.get("status_category")
+        or (s.get("status_bucket") if s.get("status_bucket") in ("failed", "blocked") else ""),
         "line": " ".join((s.get("status_line") or summary.get("status_detail") or "").split()),
         "recent": " ".join((summary.get("recent_action") or "").split()),
         "needs": " ".join((summary.get("needs_action") or "").split()),
@@ -570,6 +583,22 @@ def spawn_in_pty(cmd, cwd, timeout=90, env=None):
     return re.sub(r"[ \t]+", " ", ANSI.sub(" ", buf.decode("utf-8", "replace")))
 
 
+def start_cloud(folder, name, prompt, model, env_args, cfg):
+    """Upload `folder` as it is (CCR_FORCE_BUNDLE: never through GitHub) and start a cloud
+    session on it. Gives (session id, link)."""
+    out = spawn_in_pty(["claude", "--cloud", prompt, "-n", session_title(name, cfg)]
+                       + (["--model", model] if model else []) + env_args, cwd=folder,
+                       timeout=300, env={"CCR_FORCE_BUNDLE": "1"})
+    if "trust this folder" in out:
+        die(f"{folder} is not a trusted folder. The owner must run `claude` there once "
+            "and accept the trust prompt. Do not accept it for them.", 3)
+    m = re.search(r"(session_[A-Za-z0-9]+)", out)
+    if "Created cloud session" not in out or not m:
+        die("could not create the cloud session:\n" + out.strip()[-600:])
+    url = re.search(r"https://claude\.ai/code/\S+", out)
+    return m.group(1), (url.group(0).split("?")[0] if url else f"https://claude.ai/code/{m.group(1)}")
+
+
 def cmd_cloud(args):
     cfg, tasks = load_config(), load_tasks()
     args.where = "cloud"
@@ -594,21 +623,11 @@ def cmd_cloud(args):
 
     model = pick_model(args, cfg, "cloud")
     env_name, env_id, env_args = pick_environment(args, cfg)
-    out = spawn_in_pty(["claude", "--cloud", full, "-n", session_title(args.name, cfg)]
-                       + (["--model", model] if model else []) + env_args, cwd=repo,
-                       timeout=300, env={"CCR_FORCE_BUNDLE": "1"})
-    if "trust this folder" in out:
-        die(f"{repo} is not a trusted folder. The owner must run `claude` there once "
-            "and accept the trust prompt. Do not accept it for them.", 3)
-    m = re.search(r"(session_[A-Za-z0-9]+)", out)
-    if "Created cloud session" not in out or not m:
-        die("could not create the cloud session:\n" + out.strip()[-600:])
-    url = re.search(r"https://claude\.ai/code/\S+", out)
+    sid, url = start_cloud(repo, args.name, full, model, env_args, cfg)
     task = {
         "name": args.name, "where": "cloud", "model": model, "environment": env_id,
-        "id": m.group(1), "repo": str(repo), "upload": True, "branch": None,
-        "base": git(repo, "rev-parse", "HEAD") or None,
-        "url": url.group(0).split("?")[0] if url else None,
+        "id": sid, "repo": str(repo), "upload": True, "branch": None,
+        "base": git(repo, "rev-parse", "HEAD") or None, "url": url,
         "started": int(time.time()),
     }
     save_tasks(tasks + [task])
@@ -682,11 +701,36 @@ def cmd_review(args):
                "--brief-file (forget it first)" if t.get("adopted") else ""))
     extra = cfg.get("extra_rules", "")
     result = RESULTS / f"{name}.md"
-    full = REVIEW.format(brief=brief, base=base, ref=ref, result=result,
-                         extra=extra + "\n" if extra else "", notify=notify_text(cfg, name))
     RESULTS.mkdir(parents=True, exist_ok=True)
-    (BRIEFS / f"{name}.md").write_text(full + "\n")
     result.unlink(missing_ok=True)
+    where, why = review_where(args, cfg, t, repo, ref)
+    if where == "cloud":
+        tip = git(repo, "rev-parse", ref)
+        report = f"dispatch-report-{name}.md"
+        full = REVIEW.format(
+            brief=brief, base=base, ref=tip[:12], result=report,
+            place="You are on a fresh machine with an uploaded copy of the repository.",
+            extra=extra + "\n" if extra else "", notify="") + CLOUD_REVIEW_SEND
+        full = full.replace(f"`{report}` in exactly", f"`{report}`, at the folder's root, in exactly")
+        (BRIEFS / f"{name}.md").write_text(full + "\n")
+        model = pick_model(args, cfg, "cloud")
+        env_name, env_id, env_args = pick_environment(argparse.Namespace(environment=None), cfg)
+        sid, url = start_cloud(why, name, full, model, env_args, cfg)
+        task = {
+            "name": name, "where": "cloud", "kind": "review", "of": args.name, "model": model,
+            "environment": env_id, "id": sid, "repo": str(repo), "upload": True, "branch": None,
+            "report": report, "url": url, "started": int(time.time()),
+        }
+        save_tasks(tasks + [task])
+        print(f"started review {name} in the cloud id={sid} repo={repo.name} diff={base}..{tip[:12]}"
+              f" environment={env_name or 'account default'}")
+        print(f"view: {url}")
+        return
+    check_limit(tasks, cfg)
+    full = REVIEW.format(brief=brief, base=base, ref=ref, result=result,
+                         place="You are in your own git worktree.",
+                         extra=extra + "\n" if extra else "", notify=notify_text(cfg, name))
+    (BRIEFS / f"{name}.md").write_text(full + "\n")
     model = pick_model(args, cfg, "local")
     task = {
         "name": name, "where": "local", "kind": "review", "of": args.name, "model": model,
@@ -694,7 +738,35 @@ def cmd_review(args):
         "worktree": True, "needs_local": True, "started": int(time.time()),
     }
     save_tasks(tasks + [task])
-    print(f"started review {name} id={task['id']} repo={repo.name} diff={base}..{ref}")
+    print(f"started review {name} on this machine id={task['id']} repo={repo.name} diff={base}..{ref}"
+          + (f" ({why})" if why else ""))
+
+
+def review_where(args, cfg, t, repo, ref):
+    """Where a review runs: ("cloud", the folder to upload) or ("local", why not the cloud).
+
+    The cloud by default: a fresh machine catches what only works on this one. Not when
+    the task needs this machine, its repository is local_only, the owner said --local or
+    review_in_cloud is false, or there is no folder whose checkout is the change's tip.
+    """
+    if getattr(args, "local", False):
+        return "local", ""
+    if cfg.get("review_in_cloud", True) is False:
+        return "local", "review_in_cloud is false in the config"
+    if t.get("needs_local"):
+        return "local", "the task needs this machine"
+    if any(repo.name == n or str(repo).endswith(n) for n in cfg.get("local_only", [])):
+        return "local", f"{repo.name} is local_only"
+    tip = git(repo, "rev-parse", ref)
+    wt = repo / ".claude" / "worktrees" / t["name"]
+    for folder in (wt, repo):
+        if folder.is_dir() and git(folder, "rev-parse", "HEAD") == tip:
+            try:
+                claude_login(soft=True)
+            except LoginMissing as e:
+                return "local", f"no claude.ai login for the cloud: {e}"
+            return "cloud", folder
+    return "local", "no folder here has the change checked out to upload"
 
 
 FIX = """\
@@ -743,6 +815,9 @@ def cmd_fix(args):
         die(f"{args.name} was already sent back {done} times (max_fix_rounds {limit}); "
             "the owner decides what happens now", 7)
     review = f"{last['name']}-review"
+    rt = next((x for x in tasks if x["name"] == review), None)
+    if rt:
+        fetch_report(rt)
     rstat, _ = read_result(review)
     if not rstat:
         die(f"{last['name']} has no finished review yet (`review {last['name']}`, then "
@@ -829,6 +904,45 @@ def cmd_wait(args):
     if left:
         print(f"still running after {args.timeout}s: {', '.join(left)}")
     cmd_status(args, cs)
+
+
+def fetch_report(t, cs=None):
+    """Copy a finished cloud review's report into results/<name>.md, once.
+
+    The review sends it with SendUserFile; if it did not, its last message that holds a
+    VERDICT line is used. Gives True when results/<name>.md exists afterwards.
+    """
+    f = RESULTS / f"{t['name']}.md"
+    if f.exists():
+        return True
+    if t.get("where") != "cloud" or t.get("kind") != "review":
+        return False
+    s = (cs or CloudSessions()).get(t["id"])
+    if not isinstance(s, dict) or session_busy(session_facts(s)):
+        return False
+    try:
+        token, org = claude_login(soft=True)
+    except LoginMissing:
+        return False
+    events = session_events(t["id"], token, org)
+    sent, written, _ = session_files(events)
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    for path, info in sent.items():
+        if path.endswith("/" + t.get("report", "")):
+            if download(info["uuid"], token, org, f, info.get("size")):
+                return True
+    for path, text in written.items():
+        if path.endswith("/" + t.get("report", "")) and "VERDICT:" in text:
+            f.write_text(text)
+            return True
+    for p in reversed(events):
+        content = (p.get("message") or {}).get("content") if p.get("type") == "assistant" else None
+        text = "\n".join(b.get("text", "") for b in content if b.get("type") == "text") \
+            if isinstance(content, list) else ""
+        if "VERDICT:" in text and "STATUS:" in text:
+            f.write_text(text[text.index("STATUS:"):].strip() + "\n")
+            return True
+    return False
 
 
 def read_result(name):
@@ -943,7 +1057,9 @@ def cmd_status(args, cs=None):
     live = sessions()
     for t in tasks:
         age = int((time.time() - t["started"]) / 60)
-        if t["where"] == "cloud":
+        if t["where"] == "cloud" and t.get("kind") == "review" and fetch_report(t, cs):
+            state, note = read_result(t["name"])
+        elif t["where"] == "cloud":
             state, note = cloud_state(t, cs)
             if state == "running-or-no-output" and age >= 20:
                 # nothing can be read from a cloud session here; only GitHub shows its work
@@ -975,6 +1091,9 @@ def cmd_result(args):
     t = next((t for t in load_tasks() if t["name"] == args.name), None)
     if not t:
         die(f"no task named {args.name}")
+    if t["where"] == "cloud" and t.get("kind") == "review" and fetch_report(t):
+        print((RESULTS / f"{args.name}.md").read_text())
+        return
     if t["where"] == "cloud":
         cs = CloudSessions()
         state, note = cloud_state(t, cs)
@@ -1406,6 +1525,8 @@ def main():
         s.add_argument("name")
         if name == "review":
             s.add_argument("--model", help="model for the review session")
+            s.add_argument("--local", action="store_true",
+                           help="review on this machine, not in the cloud")
         s.set_defaults(fn=fn)
 
     args = p.parse_args()

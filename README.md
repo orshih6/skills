@@ -25,11 +25,14 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
 - **`collect`** first has each finished task reviewed by a new session that did not
   write it and has not seen its report, then gives the results in order of risk, with
   the findings the reviewer could confirm. `/dispatch review <name>` does it for one task.
+- After `collect`, the finished sessions and their worktrees are removed once you
+  agree. A local task's commits stay on its branch; nothing is pushed or merged for you.
 - **`handoff`** is for when you have to leave: tasks that can run in the cloud are pushed
   to a branch and continued there; the rest are listed with how to keep them running.
 
 Every dispatched session works on its own branch and is told never to push the default
-branch, merge, deploy, spend money or message anyone. It reports in a fixed shape that
+branch, merge, deploy, spend money or message anyone. A local session does not push its
+branch either, unless the task asks for it. It reports in a fixed shape that
 the manager reads instead of the session's log.
 
 Needs Claude Code 2.1 or newer (`claude --bg`, `claude --cloud`), `git`, Python 3, and

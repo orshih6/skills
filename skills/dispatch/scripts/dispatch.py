@@ -270,13 +270,27 @@ def claude_config_dir():
     return os.environ.get("CLAUDE_CONFIG_DIR")
 
 
-def claude_login():
+class LoginMissing(Exception):
+    pass
+
+
+def claude_login(soft=False):
     """(access token, organization uuid) of the claude CLI's claude.ai login.
 
     The same login `claude --cloud` uses, read where the CLI keeps it: the
     CLAUDE_CODE_OAUTH_TOKEN variable, `.credentials.json` in its config folder, or the
-    macOS Keychain. Never printed and never written anywhere.
+    macOS Keychain. Never printed and never written anywhere. Without a usable login it
+    stops with an error, or with soft raises LoginMissing.
     """
+    try:
+        return read_login()
+    except LoginMissing as e:
+        if soft:
+            raise
+        die(str(e), 6)
+
+
+def read_login():
     custom = claude_config_dir()
     folder = Path(custom) if custom else Path.home() / ".claude"
     token, expires = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), None
@@ -297,23 +311,24 @@ def claude_login():
             oauth = {}
         token, expires = oauth.get("accessToken"), oauth.get("expiresAt")
     if not token:
-        die("no claude.ai login found for the claude CLI. Run `claude` and sign in with "
-            "your subscription (/login), then try again.", 6)
+        raise LoginMissing("no claude.ai login found for the claude CLI. Run `claude` and "
+                           "sign in with your subscription (/login), then try again.")
     if expires and expires / 1000 < time.time():
-        die("the claude CLI's login has expired. Start `claude` once so it renews the "
-            "login, then try again.", 6)
+        raise LoginMissing("the claude CLI's login has expired. Start `claude` once so it "
+                           "renews the login, then try again.")
     state = (Path(custom) if custom else Path.home()) / ".claude.json"
     try:
         org = json.loads(state.read_text()).get("oauthAccount", {}).get("organizationUuid")
     except (OSError, json.JSONDecodeError):
         org = None
     if not org:
-        die(f"no organization found in {state}. Run `claude` and sign in, then try again.", 6)
+        raise LoginMissing(f"no organization found in {state}. Run `claude` and sign in, "
+                           "then try again.")
     return token, org
 
 
-def api_get(path, token, org, extra_headers=None, optional=False):
-    """GET a claude.ai API path as JSON. Stops with an error, or gives None when optional."""
+def api_call(path, token, org, extra_headers=None):
+    """GET a claude.ai API path: (HTTP status, JSON body). Status 0 when it was not reached."""
     url = os.environ.get("DISPATCH_API_URL", "https://api.anthropic.com") + path
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}", "x-organization-uuid": org,
@@ -322,16 +337,84 @@ def api_get(path, token, org, extra_headers=None, optional=False):
     })
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read().decode())
+            return r.status, json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        if optional:
-            return None
-        die(f"GET {path} failed: HTTP {e.code}. If it is 401, start `claude` once so it "
-            "renews the login.", 6)
+        return e.code, None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
-        if optional:
+        return 0, str(e)
+
+
+def api_get(path, token, org, extra_headers=None, optional=False):
+    """GET a claude.ai API path as JSON. Stops with an error, or gives None when optional."""
+    code, body = api_call(path, token, org, extra_headers)
+    if code == 200:
+        return body
+    if optional:
+        return None
+    if code:
+        die(f"GET {path} failed: HTTP {code}. If it is 401, start `claude` once so it "
+            "renews the login.", 6)
+    die(f"GET {path} failed: {body}", 6)
+
+
+GONE = "gone"
+
+
+class CloudSessions:
+    """What claude.ai knows about cloud sessions, read through the API `claude --teleport`
+    uses (GET /v1/code/sessions/<id>). Not documented; it may change with a CLI update.
+
+    get() gives the session's fields, GONE when claude.ai no longer has it, or None when
+    nothing could be read (no login, no network, an unknown answer). Each session is read
+    once per run of the helper; `fresh` reads again (for `wait`).
+    """
+
+    def __init__(self):
+        self.login, self.cache, self.problem = None, {}, None
+
+    def get(self, sid, fresh=False):
+        if not sid:
             return None
-        die(f"GET {path} failed: {e}", 6)
+        if sid in self.cache and not fresh:
+            return self.cache[sid]
+        if self.login is None:
+            try:
+                self.login = claude_login(soft=True)
+            except LoginMissing as e:
+                self.login, self.problem = False, str(e)
+        if not self.login:
+            return None
+        cse = "cse_" + sid[len("session_"):] if sid.startswith("session_") else sid
+        code, body = api_call(f"/v1/code/sessions/{urllib.parse.quote(cse)}", *self.login)
+        if code == 404:
+            found = GONE
+        elif code == 200 and isinstance(body, dict):
+            s = body.get("response_shape") or body.get("session") or body
+            found = s if isinstance(s, dict) and s.get("id") else None
+        else:
+            found = None
+        if found is None:
+            self.problem = f"HTTP {code}" if code else (body or "no answer")
+        self.cache[sid] = found
+        return found
+
+
+def session_facts(s):
+    """The fields of a cloud session that dispatch uses, with defaults."""
+    meta = s.get("external_metadata") or {}
+    summary = s.get("post_turn_summary") or meta.get("post_turn_summary") or {}
+    branches = [b for b in (meta.get("current_branches") or {}).values() if b]
+    return {
+        "archived": s.get("status") == "archived",
+        "worker": s.get("worker_status") or "",
+        "category": summary.get("status_category") or s.get("status_bucket") or "",
+        "line": " ".join((s.get("status_line") or summary.get("status_detail") or "").split()),
+        "recent": " ".join((summary.get("recent_action") or "").split()),
+        "needs": " ".join((summary.get("needs_action") or "").split()),
+        "branch": branches[0] if branches else None,
+        "unpushed": meta.get("unpushed_work") is True,
+        "cost": (meta.get("usage") or {}).get("cost_usd"),
+    }
 
 
 def cloud_environments():
@@ -541,9 +624,13 @@ def review_range(t, repo):
         die(f"{t['name']} has no branch (its folder is not a git repository); there is nothing to diff")
     cloud = t["where"] == "cloud"
     if cloud:
-        pr = cloud_pr(t)
+        s = CloudSessions().get(t["id"])
+        own = session_facts(s)["branch"] if isinstance(s, dict) else None
+        pr = cloud_pr(t, own)
         if pr and pr["headRefName"] != t["branch"]:
             t["branch"] = pr["headRefName"]  # the session had to push its own branch
+        elif own and own != t["branch"] and not git(repo, "ls-remote", "--heads", "origin", t["branch"]):
+            t["branch"] = own
         run(["git", "-C", str(repo), "fetch", "--quiet", "origin", t["branch"]], timeout=120)
     ref = f"origin/{t['branch']}" if cloud else t["branch"]
     if not resolves(repo, ref):
@@ -599,21 +686,33 @@ def cmd_review(args):
 
 
 def cmd_wait(args):
-    """Block until the named local tasks (default: all of them) have reported or stopped."""
-    tasks = [t for t in load_tasks() if t["where"] == "local"
-             and (not args.names or t["name"] in args.names)]
+    """Block until the named tasks (default: all of them) have reported or stopped.
+
+    A local task is waited for while its session works and has written no report; a cloud
+    task while claude.ai says its session is running. A cloud task whose state cannot be
+    read is not waited for.
+    """
+    tasks = [t for t in load_tasks() if not args.names or t["name"] in args.names]
+    cs = CloudSessions()
     end = time.time() + args.timeout
     while True:
-        live = sessions()
-        left = [t["name"] for t in tasks
-                if not (RESULTS / f"{t['name']}.md").exists()
-                and live.get(t["id"], {}).get("state") == "working"]
+        live = sessions() if any(t["where"] == "local" for t in tasks) else {}
+        left = []
+        for t in tasks:
+            if t["where"] == "cloud":
+                s = cs.get(t["id"], fresh=True)
+                busy = isinstance(s, dict) and session_facts(s)["worker"] == "running"
+            else:
+                busy = (not (RESULTS / f"{t['name']}.md").exists()
+                        and live.get(t["id"], {}).get("state") == "working")
+            if busy:
+                left.append(t["name"])
         if not left or time.time() >= end:
             break
         time.sleep(10)
     if left:
         print(f"still running after {args.timeout}s: {', '.join(left)}")
-    cmd_status(args)
+    cmd_status(args, cs)
 
 
 def read_result(name):
@@ -638,13 +737,15 @@ def read_result(name):
     return status, (" ".join(s.group(1).split()) if s else "")
 
 
-def cloud_pr(t):
-    """The task's pull request: by its branch, else by the DISPATCH line in the body
-    (a cloud session that may only push its own branch opens it from that one)."""
+def cloud_pr(t, own=None):
+    """The task's pull request: by its branch or the session's own branch (`own`, from
+    claude.ai), else by the DISPATCH line in the body (a cloud session that may only push
+    its own branch opens it from that one)."""
     if not shutil.which("gh"):
         return None
     fields = "url,state,isDraft,body,headRefName"
-    for find in (["--head", t["branch"]], ["--search", f'"DISPATCH: {t["name"]}" in:body']):
+    heads = [["--head", b] for b in dict.fromkeys([t["branch"], own]) if b]
+    for find in heads + [["--search", f'"DISPATCH: {t["name"]}" in:body']]:
         r = run(["gh", "pr", "list", *find, "--state", "all", "--json", fields, "--limit", "5"],
                 cwd=t["repo"])
         if r.returncode != 0 or r.stdout.strip() in ("", "[]"):
@@ -656,21 +757,49 @@ def cloud_pr(t):
     return None
 
 
-def cloud_state(t):
-    """A cloud task is judged by what reached GitHub: its branch and pull request."""
-    repo = t["repo"]
-    pr = cloud_pr(t)
+def cloud_state(t, cs=None):
+    """(state, note) of a cloud task.
+
+    Its own report in the pull request wins. Then what claude.ai says the session is
+    doing (running, or stopped on a question). Then what reached GitHub. Then why
+    nothing did: claude.ai says whether the session failed, is blocked, or stopped with
+    its work unpushed. Without claude.ai (no login, no network) only GitHub is read, as
+    `running-or-no-output`, which status turns into `quiet` after 20 minutes.
+    """
+    repo, url = t["repo"], t.get("url") or ""
+    s = (cs or CloudSessions()).get(t["id"])
+    f = session_facts(s) if isinstance(s, dict) else None
+    pr = cloud_pr(t, f and f["branch"])
     if pr:
         m = re.search(r"STATUS:\s*(\w+)", pr.get("body") or "")
-        st = m.group(1).lower() if m else ("draft" if pr["isDraft"] else "pr-open")
-        return st, pr["url"]
-    if git(repo, "ls-remote", "--heads", "origin", t["branch"]):
-        return "branch-pushed", f"branch {t['branch']} (no pull request yet)"
-    return "running-or-no-output", t.get("url") or ""
+        if m:
+            return m.group(1).lower(), pr["url"]
+    if f and f["worker"] == "running":
+        return "running", f["line"] or f["recent"]
+    if f and f["worker"] == "requires_action":
+        return "waiting-for-you", f"{f['needs'] or f['line'] or 'it waits for an answer'}; open {url}"
+    if pr:
+        return ("draft" if pr["isDraft"] else "pr-open"), pr["url"]
+    for b in dict.fromkeys([t["branch"], f and f["branch"]]):
+        if b and git(repo, "ls-remote", "--heads", "origin", b):
+            return "branch-pushed", f"branch {b} (no pull request yet)"
+    if s == GONE:
+        return "gone", "claude.ai no longer has this session, and nothing of it is on GitHub"
+    if not f:
+        return "running-or-no-output", url
+    line = f["line"] or f["recent"]
+    if f["category"] == "failed":
+        return "failed", f"{line}; open {url}"
+    if f["category"] in ("blocked", "waiting"):
+        return "blocked", f"{f['needs'] or line}; open {url}"
+    if f["archived"]:
+        return "archived", f"archived on claude.ai with nothing on GitHub; {line}"
+    return "not-pushed", f"stopped, nothing on GitHub{' (unpushed work)' if f['unpushed'] else ''}: {line}; open {url}"
 
 
-def cmd_status(args):
+def cmd_status(args, cs=None):
     tasks = load_tasks()
+    cs = cs or CloudSessions()
     only = getattr(args, "repo", None)
     if only:
         only = str(Path(only).expanduser().resolve())
@@ -682,7 +811,7 @@ def cmd_status(args):
     for t in tasks:
         age = int((time.time() - t["started"]) / 60)
         if t["where"] == "cloud":
-            state, note = cloud_state(t)
+            state, note = cloud_state(t, cs)
             if state == "running-or-no-output" and age >= 20:
                 # nothing can be read from a cloud session here; only GitHub shows its work
                 state, note = "quiet", f"nothing on GitHub after {age}m; stuck or unable to push, open {note}"
@@ -705,6 +834,8 @@ def cmd_status(args):
                 state, note = "gone", "session no longer listed and left no report"
         where = "review" if t.get("kind") == "review" else t["where"]
         print(f"{t['name']:<28} {where:<6} {state:<20} {age:>4}m  {Path(t['repo']).name}  {note if 'https://' in note or len(note) <= 90 else note[:89] + '…'}")
+    if cs.problem and any(t["where"] == "cloud" for t in tasks):
+        print(f"note: claude.ai could not be read ({cs.problem}); cloud states come from GitHub only")
 
 
 def cmd_result(args):
@@ -712,8 +843,23 @@ def cmd_result(args):
     if not t:
         die(f"no task named {args.name}")
     if t["where"] == "cloud":
-        state, note = cloud_state(t)
-        print(f"STATUS: {state}\n{note}\nview: {t.get('url')}\nbring it to this computer: claude --teleport {t['id']}")
+        cs = CloudSessions()
+        state, note = cloud_state(t, cs)
+        s = cs.get(t["id"])
+        lines = [f"STATUS: {state}", note]
+        if isinstance(s, dict):  # the session's own words, as claude.ai shows them
+            f = session_facts(s)
+            for label, key in (("NOW", "line"), ("LAST", "recent"), ("NEEDS", "needs"), ("BRANCH", "branch")):
+                if f[key] and f[key] not in note:
+                    lines.append(f"{label}: {f[key]}")
+            if f["unpushed"]:
+                lines.append("UNPUSHED: the session holds work that is not on GitHub")
+            if isinstance(f["cost"], (int, float)):
+                lines.append(f"COST: ${f['cost']:.2f}")
+        elif cs.problem:
+            lines.append(f"note: claude.ai could not be read ({cs.problem})")
+        lines += [f"view: {t.get('url')}", f"bring it to this computer: claude --teleport {t['id']}"]
+        print("\n".join(lines))
         return
     f = RESULTS / f"{args.name}.md"
     print(f.read_text() if f.exists() else f"no report yet; look with: claude logs {t['id']}")
@@ -844,8 +990,8 @@ def main():
     s = sub.add_parser("status", help="one line per task")
     s.add_argument("--repo", help="only the tasks of this project directory")
     s.set_defaults(fn=cmd_status)
-    s = sub.add_parser("wait", help="block until local tasks report, then print status")
-    s.add_argument("names", nargs="*", help="task names (default: every local task)")
+    s = sub.add_parser("wait", help="block until tasks report or stop, then print status")
+    s.add_argument("names", nargs="*", help="task names (default: every task)")
     s.add_argument("--timeout", type=int, default=540, help="seconds to wait at most")
     s.set_defaults(fn=cmd_wait)
     s = sub.add_parser("envs", help="list the account's cloud environments (claude.ai/code)")

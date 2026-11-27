@@ -22,9 +22,12 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
 - **`/dispatch <tasks>`** writes a self-contained brief for each task and starts one
   session per task: `claude --bg` in its own git worktree, or `claude --cloud` when the
   repo is on GitHub and the task needs nothing from your machine.
-- **`status`** shows one line per task. A cloud task is judged by what reached GitHub
-  (a pull request or a pushed branch); one with nothing there after 20 minutes shows as
-  `quiet`: it may still be working or be stuck, so open its link and look.
+- **`status`** shows one line per task. For a cloud task it asks claude.ai what the
+  session is doing, through the API `claude --teleport` uses: running (with its own
+  one-line status), waiting for you, failed, blocked, or stopped with nothing pushed.
+  Its pull request, when there is one, is still the final report. Without the CLI's
+  login only GitHub is read, and a task with nothing there after 20 minutes shows as
+  `quiet`. `wait` waits for running cloud sessions too.
 - **`envs`** lists your cloud environments as claude.ai/code has them (the same list as
   `/remote-env`), with the name your config gives each one. A cloud task can then pick
   one by that claude.ai name: `--environment "Light"`. It uses the claude CLI's

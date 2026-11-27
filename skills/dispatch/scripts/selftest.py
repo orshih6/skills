@@ -11,8 +11,8 @@ called, prints `backgrounded · abc12345` for a start, and answers
     python3 skills/dispatch/scripts/selftest.py wait   only checks whose name holds "wait"
 
 Prints one line per check (`ok` or `FAIL` with the reason) and a one-line total.
-Exits 0 when every check passes and 1 otherwise. `cloud` is not covered: it needs a
-pseudo-terminal and GitHub.
+Exits 0 when every check passes and 1 otherwise. Starting a cloud session is not
+covered (it needs a pseudo-terminal and GitHub); reading one is, with a stand-in API.
 """
 
 import importlib.util
@@ -735,7 +735,7 @@ ENV_PAGES = {
 }
 
 
-def fake_api(seen):
+def fake_api(seen, sessions=None):
     import http.server
     import threading
     from urllib.parse import parse_qs, urlparse
@@ -748,6 +748,9 @@ def fake_api(seen):
                 body, code = {"error": "unauthorized"}, 401
             elif u.path == "/v1/environment_providers":
                 body, code = ENV_PAGES[parse_qs(u.query).get("after_id", [None])[0]], 200
+            elif u.path.startswith("/v1/code/sessions/") and sessions is not None:
+                found = sessions.get(u.path.rsplit("/", 1)[1])
+                body, code = ({"response_shape": found}, 200) if found else ({"error": "not found"}, 404)
             else:  # no self-hosted pools on this account
                 body, code = {"error": "not found"}, 404
             data = json.dumps(body).encode()
@@ -836,6 +839,89 @@ def envs_checks(e):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+    finally:
+        srv.shutdown()
+
+
+# cloud tasks read through the API `claude --teleport` uses (a stand-in on 127.0.0.1) ----
+
+
+def cloud_session(sid, worker, category="", line="", needs="", unpushed=False, branch=None):
+    return {"id": sid, "status": "active", "worker_status": worker, "status_line": line,
+            "post_turn_summary": {"status_category": category, "needs_action": needs,
+                                  "recent_action": "", "status_detail": line},
+            "external_metadata": {"unpushed_work": unpushed, "usage": {"cost_usd": 1.5},
+                                  "current_branches": {"": branch} if branch else {}}}
+
+
+def cloud_task(name, n, started=None):
+    return {"name": name, "where": "cloud", "id": f"session_0{n}", "repo": "",
+            "branch": f"dispatch/{name}", "base": "main",
+            "url": f"https://claude.ai/code/session_0{n}", "started": started or int(time.time())}
+
+
+@check("cloud: status, wait and result read the session from claude.ai")
+def cloud_checks(e):
+    live = {}
+    seen = []
+    srv = fake_api(seen, live)
+    try:
+        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"):
+            e.env.pop(k, None)
+        e.env["DISPATCH_API_URL"] = f"http://127.0.0.1:{srv.server_address[1]}"
+        old = int(time.time()) - 3600
+        tasks = [cloud_task(n, i, old) for i, n in enumerate(
+            ("run", "ask", "fail", "stuck", "unpushed", "deleted"), 1)]
+        for t in tasks:
+            t["repo"] = str(e.repo)
+        (e.home / "tasks.jsonl").write_text("".join(json.dumps(t) + "\n" for t in tasks))
+
+        rows, out = e.status()  # no login: GitHub only, so after 20 minutes each is quiet
+        same({r[1] for r in rows.values()}, {"quiet"}, "states without a claude.ai login")
+        has(out, "note: claude.ai could not be read", "the note when claude.ai is not read")
+
+        (e.dir / ".claude").mkdir()
+        (e.dir / ".claude" / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "tok-123", "expiresAt": int(time.time() + 3600) * 1000}}))
+        (e.dir / ".claude.json").write_text(json.dumps({"oauthAccount": {"organizationUuid": "org-9"}}))
+        live.update({
+            "cse_01": cloud_session("cse_01", "running", line="writing the tests"),
+            "cse_02": cloud_session("cse_02", "requires_action", needs="approve the migration"),
+            "cse_03": cloud_session("cse_03", "idle", "failed", line="API Error: 529 Overloaded"),
+            "cse_04": cloud_session("cse_04", "idle", "blocked", needs="which currency?"),
+            "cse_05": cloud_session("cse_05", "idle", "completed", line="price column added",
+                                    unpushed=True, branch="claude/own-branch"),
+        })
+        rows, out = e.status()
+        want = {
+            "run": ("running", "writing the tests"),
+            "ask": ("waiting-for-you", "approve the migration; open https://claude.ai/code/session_02"),
+            "fail": ("failed", "API Error: 529 Overloaded; open https://claude.ai/code/session_03"),
+            "stuck": ("blocked", "which currency?; open https://claude.ai/code/session_04"),
+            "unpushed": ("not-pushed", "stopped, nothing on GitHub (unpushed work): price column added; "
+                                       "open https://claude.ai/code/session_05"),
+            "deleted": ("gone", "claude.ai no longer has this session, and nothing of it is on GitHub"),
+        }
+        for name, (state, note) in want.items():
+            same((rows[name][1], rows[name][3]), (state, note), f"cloud task {name}")
+        expect("note: claude.ai" not in out, f"a note although claude.ai was read: {out!r}")
+        same({p for p, _ in seen if p.startswith("/v1/code/sessions/")},
+             {f"/v1/code/sessions/cse_0{i}" for i in range(1, 7)}, "sessions asked for (session_ is cse_)")
+
+        r = e.d("result", "unpushed")
+        same(r.returncode, 0, f"result exit code ({r.stderr.strip()})")
+        for part in ("STATUS: not-pushed", "BRANCH: claude/own-branch", "UNPUSHED:", "COST: $1.50",
+                     "claude --teleport session_05"):
+            has(r.stdout, part, "result of a cloud task")
+        expect("tok-123" not in r.stdout + r.stderr, "the token was printed")
+
+        rows, out = e.status(("wait", "run", "ask", "--timeout", "0"))
+        same(out.splitlines()[0], "still running after 0s: run", "wait: only the running session is waited for")
+        live["cse_01"] = cloud_session("cse_01", "idle", "completed", line="done")
+        t0 = time.time()
+        rows, out = e.status(("wait", "run"))
+        expect(time.time() - t0 < 8, "wait slept although the cloud session is idle")
+        expect("still running" not in out, f"wait reports an idle cloud session as running: {out!r}")
     finally:
         srv.shutdown()
 

@@ -17,7 +17,7 @@ D="${CLAUDE_SKILL_DIR}/scripts/dispatch.py"   # scripts/ next to this file
 python3 $D local  --repo <dir> --name <name> --brief-file <file> [--needs-local] [--no-worktree] [--model <id>]
 python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch>] [--model <id>] [--environment <name|id>]
 python3 $D review <name> [--model <id>]
-python3 $D wait   [<name> ...] [--timeout <seconds>]
+python3 $D wait   [<name> ...] [--timeout <seconds>]   # local and cloud tasks
 python3 $D status [--repo <dir>]
 python3 $D envs   [--json]
 python3 $D result <name>
@@ -83,15 +83,32 @@ Run `status` and show its lines as a table. States:
 - `waiting-for-you`: it stopped on a prompt. Give the user the `claude attach <id>` shown.
 - `stopped-no-report`: it ended without reporting. Only then look at its log, and only
   the end: `claude logs <id> | tail -c 3000` (the log is raw terminal output and large).
-- Cloud tasks are judged by what reached GitHub: a pull request, a pushed branch, or
-  nothing yet. Their live progress is only visible at the `view:` link; nothing on this
-  machine can read it.
-- `quiet`: a cloud task with nothing on GitHub after 20 minutes. It may still be
-  working, or it finished and could not push: without the Claude GitHub App on the
-  repo, a cloud session does the work and then has no way to send it back. Give the
-  user the link and ask them to look; do not start it again on a guess. If the push
-  failed, the user installs the app and then tells that session, in the browser, to
-  push its branch and open the pull request as its brief says.
+
+A cloud task's line comes from two places. Its pull request, when its description has a
+`STATUS:` line, is its report and wins. Otherwise the helper asks claude.ai what the
+session is doing, through the API `claude --teleport` uses (`GET /v1/code/sessions/<id>`,
+with the CLI's own login), and the note is the session's own one-line status:
+
+- `running`: the session is working now.
+- `waiting-for-you`: it stopped on a permission prompt or a question. Give the user its
+  link; they answer in the browser, or bring it here with `claude --teleport <id>`.
+- `pr-open` / `draft` / `branch-pushed`: work reached GitHub, but without a report.
+- `failed` / `blocked`: the session stopped and says why (an API error, a question).
+  Pass that on; do not start it again without asking.
+- `not-pushed`: the session stopped and nothing is on GitHub. Usually the push failed:
+  without the Claude GitHub App on the repo, a cloud session does the work and then has
+  no way to send it back. The user installs the app and tells that session, in the
+  browser, to push its branch and open the pull request as its brief says.
+- `gone` / `archived`: claude.ai no longer has the session, or it was archived, and
+  nothing of it is on GitHub. `forget` it once the user agrees.
+- `quiet`: only when claude.ai could not be read (the status then ends with a `note:`
+  line saying why): nothing on GitHub after 20 minutes. Give the user the link and ask
+  them to look; do not start it again on a guess.
+
+`result <name>` of a cloud task adds the session's last action, what it needs, the branch
+it is on, whether it holds unpushed work, and what it has cost. The API has no
+documentation, so a Claude Code update can change it; the helper then falls back to
+GitHub only and says so.
 
 ## `/dispatch envs`
 
@@ -128,7 +145,8 @@ did not write the change checks it.
    lines are named) or PLAUSIBLE. Do not review tasks that report `failed` or `blocked`, and skip the step
    when the user says so ("collect, no review"). The review of a cloud task also runs
    on this machine, on the branch fetched from GitHub.
-2. **Wait** for the reviews: `wait <name>-review ... --timeout 540`. It prints the
+2. **Wait** for the reviews: `wait <name>-review ... --timeout 540`. (`wait` also takes
+   cloud tasks: it waits while claude.ai says the session is running.) It prints the
    status line of every task when the named ones have reported, and starts with a
    `still running after ...` line when the time ran out first. If some reviews are
    still running then, report the rest now and say which are pending.

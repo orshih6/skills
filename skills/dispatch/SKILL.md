@@ -14,9 +14,9 @@ Everything goes through one helper:
 
 ```bash
 D="${CLAUDE_SKILL_DIR}/scripts/dispatch.py"   # scripts/ next to this file
-python3 $D local  --repo <dir> --name <name> --brief-file <file> [--needs-local] [--no-worktree]
-python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch>]
-python3 $D review <name>
+python3 $D local  --repo <dir> --name <name> --brief-file <file> [--needs-local] [--no-worktree] [--model <id>]
+python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch>] [--model <id>]
+python3 $D review <name> [--model <id>]
 python3 $D wait   [<name> ...] [--timeout <seconds>]
 python3 $D status
 python3 $D result <name>
@@ -80,7 +80,11 @@ Run `status` and show its lines as a table. States:
 - `stopped-no-report`: it ended without reporting. Only then look at its log, and only
   the end: `claude logs <id> | tail -c 3000` (the log is raw terminal output and large).
 - Cloud tasks are judged by what reached GitHub: a pull request, a pushed branch, or
-  nothing yet. Their live progress is only visible at the `view:` link.
+  nothing yet. Their live progress is only visible at the `view:` link; nothing on this
+  machine can read it.
+- `quiet`: a cloud task with nothing on GitHub after 20 minutes. It may still be
+  working, or it may be waiting on something (access to the repository, a question).
+  Give the user the link and ask them to look; do not start it again on a guess.
 
 ## `/dispatch collect`
 
@@ -135,7 +139,11 @@ every local task that `status` shows as `running`:
 1. Ask the session to hand off: send it the message `Hand off now, as your brief
    describes.` (SendMessage to the session's name, if that tool is available). It
    commits its work in progress, pushes its branch and writes a report with
-   `STATUS: handoff`. Wait up to two minutes for the report to appear.
+   `STATUS: handoff`. Wait for the report with `wait <name> --timeout 300`: a session
+   only reads the message between two of its steps, and one step can take minutes.
+   Read the report with `result <name>`. If it says nothing is left to do, the task is
+   finished: skip step 3, stop the session, and tell the user it finished instead of
+   moving.
 2. If there is no way to message it, or no report appears: `claude stop <id>`, then in
    its worktree (`<repo>/.claude/worktrees/<name>`) commit everything to its branch with
    the message `wip: handoff` and push the branch. Never push the default branch.
@@ -170,6 +178,7 @@ prints the command).
 ```json
 {
   "max_parallel": 4,
+  "cloud_model": "claude-opus-5-5",
   "local_only": ["infra", "some-repo-name"],
   "notify": "notify-send 'dispatch: {name} finished'",
   "leftovers": [".idea/"],
@@ -178,6 +187,9 @@ prints the command).
 ```
 
 - `max_parallel`: local sessions allowed to run at once (default 4).
+- `cloud_model`, `local_model`: the model every cloud session, or every local session
+  and review, starts on. Without them a session uses the account's default. Pass
+  `--model` only when the user names a model for one task; it wins over the config.
 - `local_only`: repo directory names that must never go to the cloud.
 - `notify`: a command each local session runs once when it reports.
 - `leftovers`: endings of untracked paths that `clean` may delete from a worktree, on
@@ -203,3 +215,5 @@ prints the command).
   The helper lists `.claude/worktrees/` in the repo's `.git/info/exclude`, so the
   worktrees do not show up in `git status`.
 - A cloud session works on a clone from GitHub. It never sees local files or secrets.
+  It runs on the account's default cloud environment, which the helper cannot choose:
+  that environment's setup script runs before every task, so a heavy one delays them all.

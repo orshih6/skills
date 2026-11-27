@@ -170,6 +170,9 @@ def load_tasks():
 
 def save_tasks(tasks):
     HOME.mkdir(parents=True, exist_ok=True)
+    for t in tasks:  # "model" is only written when one was chosen
+        if t.get("model") is None:
+            t.pop("model", None)
     TASKS.write_text("".join(json.dumps(t) + "\n" for t in tasks))
 
 
@@ -243,9 +246,16 @@ def hide_worktrees(repo):
         f.write_text(old + ("" if old.endswith("\n") or not old else "\n") + line + "\n")
 
 
-def start_bg(repo, name, prompt, worktree):
+def pick_model(args, cfg, where):
+    """--model wins, then the config's cloud_model or local_model, then the account default."""
+    return getattr(args, "model", None) or cfg.get(f"{where}_model") or None
+
+
+def start_bg(repo, name, prompt, worktree, model=None):
     """Start a local background session and return its short id."""
     cmd = ["claude", "--bg", "-n", name]
+    if model:
+        cmd += ["--model", model]
     if worktree:
         hide_worktrees(repo)
         cmd += ["-w", name]
@@ -282,8 +292,10 @@ def cmd_local(args):
     result.unlink(missing_ok=True)
 
     base = git(repo, "rev-parse", "HEAD") if is_git else None
+    model = pick_model(args, cfg, "local")
     task = {
-        "name": args.name, "where": "local", "id": start_bg(repo, args.name, full, use_wt),
+        "name": args.name, "where": "local", "model": model,
+        "id": start_bg(repo, args.name, full, use_wt, model),
         "repo": str(repo), "branch": branch if is_git else None, "base": base or None,
         "worktree": use_wt, "needs_local": bool(args.needs_local),
         "started": int(time.time()),
@@ -357,7 +369,9 @@ def cmd_cloud(args):
     BRIEFS.mkdir(parents=True, exist_ok=True)
     (BRIEFS / f"{args.name}.md").write_text(full + "\n")
 
-    out = spawn_in_pty(["claude", "--cloud", full, "-n", args.name], cwd=repo)
+    model = pick_model(args, cfg, "cloud")
+    out = spawn_in_pty(["claude", "--cloud", full, "-n", args.name]
+                       + (["--model", model] if model else []), cwd=repo)
     if "trust this folder" in out:
         die(f"{repo} is not a trusted folder. The owner must run `claude` there once "
             "and accept the trust prompt. Do not accept it for them.", 3)
@@ -366,13 +380,14 @@ def cmd_cloud(args):
         die("could not create the cloud session:\n" + out.strip()[-600:])
     url = re.search(r"https://claude\.ai/code/\S+", out)
     task = {
-        "name": args.name, "where": "cloud", "id": m.group(1), "repo": str(repo),
+        "name": args.name, "where": "cloud", "model": model, "id": m.group(1), "repo": str(repo),
         "branch": branch, "base": args.base or git(repo, "branch", "--show-current") or None,
         "url": url.group(0).split("?")[0] if url else None,
         "started": int(time.time()),
     }
     save_tasks(tasks + [task])
-    print(f"started cloud {args.name} id={task['id']} repo={repo.name} branch={branch}")
+    print(f"started cloud {args.name} id={task['id']} repo={repo.name} branch={branch}"
+          + (f" model={model}" if model else ""))
     print(f"view: {task['url']}")
 
 
@@ -430,9 +445,10 @@ def cmd_review(args):
     RESULTS.mkdir(parents=True, exist_ok=True)
     (BRIEFS / f"{name}.md").write_text(full + "\n")
     result.unlink(missing_ok=True)
+    model = pick_model(args, cfg, "local")
     task = {
-        "name": name, "where": "local", "kind": "review", "of": args.name,
-        "id": start_bg(repo, name, full, True), "repo": str(repo), "branch": None,
+        "name": name, "where": "local", "kind": "review", "of": args.name, "model": model,
+        "id": start_bg(repo, name, full, True, model), "repo": str(repo), "branch": None,
         "worktree": True, "needs_local": True, "started": int(time.time()),
     }
     save_tasks(tasks + [task])
@@ -505,6 +521,9 @@ def cmd_status(args):
         age = int((time.time() - t["started"]) / 60)
         if t["where"] == "cloud":
             state, note = cloud_state(t)
+            if state == "running-or-no-output" and age >= 20:
+                # nothing can be read from a cloud session here; only GitHub shows its work
+                state, note = "quiet", f"nothing on GitHub after {age}m; it may be stuck, open {note}"
         else:
             s = live.get(t["id"])
             rstat, summary = read_result(t["name"])
@@ -523,7 +542,7 @@ def cmd_status(args):
             else:
                 state, note = "gone", "session no longer listed and left no report"
         where = "review" if t.get("kind") == "review" else t["where"]
-        print(f"{t['name']:<28} {where:<6} {state:<20} {age:>4}m  {Path(t['repo']).name}  {note[:90]}")
+        print(f"{t['name']:<28} {where:<6} {state:<20} {age:>4}m  {Path(t['repo']).name}  {note if 'https://' in note else note[:90]}")
 
 
 def cmd_result(args):
@@ -617,6 +636,8 @@ def main():
         s.add_argument("--repo", required=True, help="the project directory")
         s.add_argument("--name", required=True, help="short unique task name")
         s.add_argument("--brief-file", required=True, help="file holding the task brief")
+        s.add_argument("--model", help="model for this session (default: the config's "
+                                       f"{where}_model, else the account's default)")
         if where == "local":
             s.add_argument("--no-worktree", action="store_true",
                            help="work in the repo itself, not in a new git worktree")
@@ -640,6 +661,8 @@ def main():
     ):
         s = sub.add_parser(name, help=text)
         s.add_argument("name")
+        if name == "review":
+            s.add_argument("--model", help="model for the review session")
         s.set_defaults(fn=fn)
 
     args = p.parse_args()

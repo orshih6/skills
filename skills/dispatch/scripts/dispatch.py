@@ -60,8 +60,6 @@ LOCAL_PUSH = """\
   project's own instructions say to push finished work: another session reviews the
   branch first, and the owner decides what leaves the machine."""
 
-CLOUD_PUSH = "- Push only the branch named above."
-
 LOCAL_REPORT = """\
 ## Reporting (required, last step)
 
@@ -75,33 +73,13 @@ Write your result to `{result}` in exactly this shape, then stop:
 
 If you are told to hand off, write the same file with `STATUS: handoff` and put what is
 done, what is left and what you were about to try under SUMMARY, commit your work in
-progress to `{branch}`, push that branch, and stop.
+progress to `{branch}` (do not push it), and stop.
 {notify}"""
 
-CLOUD_REPORT = """\
-## Reporting (required, last step)
-
-Push the branch `{branch}` and open a pull request from it (draft if unfinished). If
-the push of that branch is refused because this session may only push its own branch,
-move your commits to the session's own branch, push that one, and open the pull
-request from it. Start the pull request description with these lines:
-
-    DISPATCH: {name}
-    STATUS: done | failed | blocked
-    TESTS: <command you ran and whether it passed, or not run and why>
-    SUMMARY: <2 to 5 lines: what changed, what is left, anything the owner must decide>
-
-If you cannot open a pull request, push the branch and add the same text as
-`DISPATCH_RESULT.md` in its last commit.
-
-If you cannot push at all (the repository refuses, or GitHub access is missing), your
-work cannot leave this machine and the owner will see nothing. Do not spend time on
-workarounds: say plainly in your last message that the push failed, why, and what the
-owner must do (usually: install the Claude GitHub App on the repository with write
-access), then stop. The owner can then tell this session to push again.
-"""
-
-UPLOAD_PUSH = "- This folder came from the owner's computer and has no GitHub remote. Do not push anywhere."
+UPLOAD_PUSH = """\
+- This folder was uploaded from the owner's computer. Do not push anything anywhere
+  and do not open a pull request, even if the project's own instructions say to:
+  the owner copies your work back from this conversation."""
 
 UPLOAD_REPORT = """\
 ## Reporting (required, last step)
@@ -418,6 +396,12 @@ class CloudSessions:
         return found
 
 
+def session_busy(f):
+    """True while a cloud session works, or has not yet ended its first turn."""
+    return f["worker"] == "running" or (not f["archived"] and not f["category"]
+                                        and f["worker"] != "requires_action")
+
+
 def session_facts(s):
     """The fields of a cloud session that dispatch uses, with defaults."""
     meta = s.get("external_metadata") or {}
@@ -550,11 +534,11 @@ def cmd_local(args):
                   "then push first or use --no-worktree.")
 
 
-def spawn_in_pty(cmd, cwd, timeout=90):
+def spawn_in_pty(cmd, cwd, timeout=90, env=None):
     """Run cmd on a pseudo-terminal (some claude flags refuse to run without one)."""
     master, slave = pty.openpty()
     p = subprocess.Popen(cmd, cwd=cwd, stdin=slave, stdout=slave, stderr=slave,
-                         start_new_session=True)
+                         start_new_session=True, env={**os.environ, **(env or {})})
     os.close(slave)
     buf, end = b"", time.time() + timeout
     while time.time() < end:
@@ -583,45 +567,29 @@ def cmd_cloud(args):
     cfg, tasks = load_config(), load_tasks()
     args.where = "cloud"
     repo, brief = check_common(args, tasks, cfg)
-    remote = git(repo, "remote", "get-url", "origin")
-    upload = "github.com" not in remote  # claude --cloud uploads the folder itself
+    # Every cloud task is uploaded: claude --cloud sends this folder itself (CCR_FORCE_BUNDLE
+    # makes it do so for a GitHub repo too), and `pull` brings the work back. No GitHub,
+    # no branch, no pull request.
     if any(repo.name == n or str(repo).endswith(n) for n in cfg.get("local_only", [])):
         die(f"{repo.name} is listed as local_only in {CONFIG}. Run it locally.", 4)
-    dirty = git(repo, "status", "--porcelain")
-    ahead = "" if upload else git(repo, "log", "--oneline", "@{u}..HEAD")
-    if upload and dirty and not args.allow_unpushed:
-        die("the folder has uncommitted changes. Without GitHub, claude --cloud uploads the "
-            "folder's git history, and those changes may not go with it. Commit first, or "
-            "pass --allow-unpushed if the task does not depend on them.", 5)
-    if not upload and (dirty or ahead) and not args.allow_unpushed:
-        die("the repo has "
-            + ("uncommitted changes" if dirty else "")
-            + (" and " if dirty and ahead else "")
-            + ("unpushed commits" if ahead else "")
-            + ". The cloud session only sees what is on GitHub. Push first, or pass "
-              "--allow-unpushed if the task does not depend on them.", 5)
-    branch = f"dispatch/{args.name}"
-    base = args.base or git(repo, "branch", "--show-current") or "the default branch"
-    if upload:
-        full = "\n\n".join([
-            brief,
-            RULES.format(branch=branch, extra=cfg.get("extra_rules", ""), push=UPLOAD_PUSH),
-            UPLOAD_REPORT.format(name=args.name),
-        ])
-    else:
-        full = "\n\n".join([
-            brief,
-            f"Start from the branch `{base}`.",
-            RULES.format(branch=branch, extra=cfg.get("extra_rules", ""), push=CLOUD_PUSH),
-            CLOUD_REPORT.format(branch=branch, name=args.name),
-        ])
+    if not git(repo, "rev-parse", "--git-dir"):
+        die(f"{repo} is not a git repository; claude --cloud uploads a folder's git history. "
+            "Run `git init` and commit the files first.", 4)
+    if not git(repo, "rev-parse", "--verify", "--quiet", "HEAD"):
+        die(f"{repo} has no commit yet; commit the files the task needs first.", 4)
+    full = "\n\n".join([
+        brief,
+        RULES.format(branch=f"dispatch/{args.name}", extra=cfg.get("extra_rules", ""), push=UPLOAD_PUSH),
+        UPLOAD_REPORT.format(name=args.name),
+    ])
     BRIEFS.mkdir(parents=True, exist_ok=True)
     (BRIEFS / f"{args.name}.md").write_text(full + "\n")
 
     model = pick_model(args, cfg, "cloud")
     env_name, env_id, env_args = pick_environment(args, cfg)
     out = spawn_in_pty(["claude", "--cloud", full, "-n", args.name]
-                       + (["--model", model] if model else []) + env_args, cwd=repo)
+                       + (["--model", model] if model else []) + env_args, cwd=repo,
+                       timeout=300, env={"CCR_FORCE_BUNDLE": "1"})
     if "trust this folder" in out:
         die(f"{repo} is not a trusted folder. The owner must run `claude` there once "
             "and accept the trust prompt. Do not accept it for them.", 3)
@@ -631,15 +599,14 @@ def cmd_cloud(args):
     url = re.search(r"https://claude\.ai/code/\S+", out)
     task = {
         "name": args.name, "where": "cloud", "model": model, "environment": env_id,
-        "id": m.group(1), "repo": str(repo), "upload": upload or None,
-        "branch": None if upload else branch,
-        "base": None if upload else (args.base or git(repo, "branch", "--show-current") or None),
+        "id": m.group(1), "repo": str(repo), "upload": True, "branch": None,
+        "base": git(repo, "rev-parse", "HEAD") or None,
         "url": url.group(0).split("?")[0] if url else None,
         "started": int(time.time()),
     }
     save_tasks(tasks + [task])
-    print(f"started cloud {args.name} id={task['id']} repo={repo.name} "
-          + ("uploaded (no GitHub; `pull` brings the work back)" if upload else f"branch={branch}")
+    print(f"started cloud {args.name} id={task['id']} repo={repo.name} uploaded "
+          "(`pull` brings the work back)"
           + (f" model={model}" if model else "")
           + f" environment={env_name or 'account default'}")
     print(f"view: {task['url']}")
@@ -759,6 +726,9 @@ def cmd_fix(args):
     if t.get("kind") in ("review", "fix"):
         die(f"{args.name} is a {t['kind']}; give the name of the task it belongs to "
             f"({t.get('of')})")
+    if t["where"] == "cloud":
+        die(f"{args.name} is a cloud task: it has no branch here to review or continue. "
+            f"`pull {args.name}`, then dispatch a new task that quotes what is wrong.")
     last, done = latest_round(tasks, args.name)
     rnd = done + 1  # this fix round's number
     limit = int(cfg.get("max_fix_rounds", 2))
@@ -784,30 +754,6 @@ def cmd_fix(args):
         die(f"a task named {name} already exists; `forget` it to start the round again")
     found = "\n".join("    " + f.strip() for f in findings)
     repo = Path(t["repo"])
-
-    if t["where"] == "cloud":
-        prev = last
-        s = CloudSessions().get(prev["id"])
-        own = session_facts(s)["branch"] if isinstance(s, dict) else None
-        pr = cloud_pr(prev, own)
-        branch = pr["headRefName"] if pr else (prev.get("branch") or own)
-        if not branch or not git(repo, "ls-remote", "--heads", "origin", branch):
-            die(f"the branch of {prev['name']} is not on GitHub; a cloud round needs it")
-        f = HOME / f".fix-{name}.md"
-        f.write_text(brief + "\n\n" + FIX.format(round=rnd + 1, branch=branch, where="",
-                                                findings=found))
-        a = argparse.Namespace(repo=str(repo), name=name, brief_file=str(f), model=args.model,
-                               base=branch, allow_unpushed=True, environment=t.get("environment"))
-        try:
-            cmd_cloud(a)
-        finally:
-            f.unlink(missing_ok=True)
-        tasks = load_tasks()
-        for x in tasks:
-            if x["name"] == name:  # the review of a round reads the whole change
-                x.update(kind="fix", of=args.name, round=rnd, base=t.get("base"))
-        save_tasks(tasks)
-        return
 
     wt = repo / ".claude" / "worktrees" / args.name if t.get("worktree") else repo
     if not wt.is_dir():
@@ -864,7 +810,7 @@ def cmd_wait(args):
         for t in tasks:
             if t["where"] == "cloud":
                 s = cs.get(t["id"], fresh=True)
-                busy = isinstance(s, dict) and session_facts(s)["worker"] == "running"
+                busy = isinstance(s, dict) and session_busy(session_facts(s))
             else:
                 busy = (not (RESULTS / f"{t['name']}.md").exists()
                         and live.get(t["id"], {}).get("state") == "working")
@@ -940,6 +886,8 @@ def cloud_state(t, cs=None):
         line = f["line"] or f["recent"]
         if f["worker"] == "running":
             return "running", line
+        if session_busy(f):
+            return "starting", "the session has not finished its first turn"
         if f["worker"] == "requires_action":
             return "waiting-for-you", f"{f['needs'] or line or 'it waits for an answer'}; open {url}"
         if f["category"] == "failed":
@@ -1403,8 +1351,6 @@ def main():
             s.add_argument("--needs-local", action="store_true",
                            help="mark the task as unable to move to the cloud")
         else:
-            s.add_argument("--base", help="branch the cloud session starts from")
-            s.add_argument("--allow-unpushed", action="store_true")
             s.add_argument("--environment", help="cloud environment: a name from the config's "
                            "`environments`, or an id (env_... or ccpool_...)")
         s.set_defaults(fn=fn)

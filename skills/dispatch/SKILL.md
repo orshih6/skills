@@ -15,7 +15,7 @@ Everything goes through one helper:
 ```bash
 D="${CLAUDE_SKILL_DIR}/scripts/dispatch.py"   # scripts/ next to this file
 python3 $D local  --repo <dir> --name <name> --brief-file <file> [--needs-local] [--no-worktree] [--model <id>]
-python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch>] [--model <id>] [--environment <name|id>]
+python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--model <id>] [--environment <name|id>]
 python3 $D review <name> [--model <id>]
 python3 $D fix    <name> [--model <id>]
 python3 $D wait   [<name> ...] [--timeout <seconds>]   # local and cloud tasks
@@ -44,17 +44,12 @@ It keeps its state in `~/.claude/dispatch/` (task list, briefs, reports), never 
      signed-in tools and network.
    - **Cloud** only when the task needs nothing that exists only on this machine
      (secrets, a cluster or VPN, a signed-in browser, hardware). Choose it for long
-     work, or when the user says they will close the laptop. Two ways:
-     - *Through GitHub* (the repo has a GitHub remote): the session clones it and its
-       work comes back as a pull request. Needs the work pushed and the Claude GitHub
-       App on the repo with write access. The helper cannot check the app: for a repo
-       that has never had a cloud task come back, ask the user to confirm it first
-       (https://github.com/apps/claude/installations/select_target).
-     - *Uploaded* (no GitHub remote): `claude --cloud` uploads the folder's committed
-       history itself, and the work comes back with `pull`: the session is told to
-       send every file it changed. No pull request, no branch, no `review` (there is
-       no diff to review; `pull` and compare instead). Commit first: uncommitted
-       changes may not be uploaded.
+     work, or when the user says they will close the laptop. A cloud task never uses
+     GitHub: `claude --cloud` uploads the folder as it is on this machine, uncommitted
+     changes included, even when the repo has a GitHub remote (the helper sets
+     `CCR_FORCE_BUNDLE`). The session never pushes or opens a pull request: it sends
+     every file it changed, and `pull` brings them back. The folder must be a git
+     repository with at least one commit.
    - Pass `--needs-local` for a local task that could never move to the cloud. `handoff`
      relies on it.
 3. **Write a brief** for each task to a temporary file. The session knows nothing about
@@ -72,8 +67,9 @@ It keeps its state in `~/.claude/dispatch/` (task list, briefs, reports), never 
 What the helper adds to every brief: work on its own branch, never push the default
 branch, never merge, deploy, spend or message anyone, never wait on a question, run the
 tests, and report in a fixed shape. A local task commits to its branch and does not
-push it or open a pull request unless the brief asks; a cloud task always pushes its
-branch and opens a pull request, because that is the only way its work comes back. Read `scripts/dispatch.py` if you need the wording.
+push it or open a pull request unless the brief asks; a cloud task never pushes and
+sends every file it created or changed with SendUserFile, so `pull` can bring them back.
+Read `scripts/dispatch.py` if you need the wording.
 
 ### When the helper refuses
 
@@ -81,7 +77,7 @@ branch and opens a pull request, because that is the only way its work comes bac
 |---|---|
 | not a trusted folder | Tell the user to run `claude` in that folder once and accept the prompt. Never accept it for them. |
 | local_only | Run the task with `local`. |
-| uncommitted or unpushed work | Ask the user whether to push first. `--allow-unpushed` only if the task does not depend on that work. |
+| not a git repository / no commit | Ask the user to `git init` and commit the files, or run it `local`. |
 | limit reached | Tell the user what is running; start the rest later. |
 
 ## `/dispatch status`
@@ -94,33 +90,27 @@ Run `status` and show its lines as a table. States:
 - `stopped-no-report`: it ended without reporting. Only then look at its log, and only
   the end: `claude logs <id> | tail -c 3000` (the log is raw terminal output and large).
 
-A cloud task's line comes from two places. Its pull request, when its description has a
-`STATUS:` line, is its report and wins. Otherwise the helper asks claude.ai what the
-session is doing, through the API `claude --teleport` uses (`GET /v1/code/sessions/<id>`,
-with the CLI's own login), and the note is the session's own one-line status:
+A cloud task's line comes from claude.ai: the helper asks what the session is doing,
+through the API `claude --teleport` uses (`GET /v1/code/sessions/<id>`, with the CLI's
+own login), and the note is the session's own one-line status:
 
-- `running`: the session is working now.
+- `starting` / `running`: the session is getting ready, or working now.
+- `done`: it finished; the note says what it did and ends with `pull <name>`. Run
+  `pull` and show the user `PULLED.md`.
 - `waiting-for-you`: it stopped on a permission prompt or a question. Give the user its
   link; they answer in the browser, or bring it here with `claude --teleport <id>`.
-- `pr-open` / `draft` / `branch-pushed`: work reached GitHub, but without a report.
 - `failed` / `blocked`: the session stopped and says why (an API error, a question).
   Pass that on; do not start it again without asking.
-- An uploaded task (no GitHub) shows `done` with `pull <name>` in its note when the
-  session finished: run `pull` and show the user `PULLED.md`.
-- `not-pushed`: the session stopped and nothing is on GitHub. Usually the push failed:
-  without the Claude GitHub App on the repo, a cloud session does the work and then has
-  no way to send it back. The user installs the app and tells that session, in the
-  browser, to push its branch and open the pull request as its brief says.
-- `gone` / `archived`: claude.ai no longer has the session, or it was archived, and
-  nothing of it is on GitHub. `forget` it once the user agrees.
-- `quiet`: only when claude.ai could not be read (the status then ends with a `note:`
-  line saying why): nothing on GitHub after 20 minutes. Give the user the link and ask
-  them to look; do not start it again on a guess.
+- `gone`: claude.ai no longer has the session; its work cannot be pulled. `forget` it
+  once the user agrees.
+- `quiet`: claude.ai could not be read (the status then ends with a `note:` line saying
+  why). Give the user the link and ask them to look; do not start it again on a guess.
 
-`result <name>` of a cloud task adds the session's last action, what it needs, the branch
-it is on, whether it holds unpushed work, and what it has cost. The API has no
-documentation, so a Claude Code update can change it; the helper then falls back to
-GitHub only and says so.
+Sessions adopted with `adopt` may be GitHub ones started elsewhere: their lines can also
+read `pr-open`, `draft`, `branch-pushed` or `not-pushed`, from what reached GitHub.
+
+`result <name>` of a cloud task adds the session's last action, what it needs, and what it
+has cost. The API has no documentation, so a Claude Code update can change it.
 
 ## `/dispatch sessions` and `/dispatch adopt <id>`
 
@@ -143,8 +133,8 @@ session that never pushed, it brings the conversation and none of the files.
 
 ## `/dispatch pull <name|id>`
 
-Brings a cloud session's files to this machine from its history, with no GitHub: for a
-session started from a folder with no GitHub remote, or one that could not push. Into
+Brings a cloud session's files to this machine from its history, with no GitHub: every
+dispatch cloud task comes back this way, and so can any other session. Into
 `~/claude-cloud/<name>/` unless `--out` says otherwise; it refuses a folder that is not
 empty unless `--into-existing`. It reads the session's events (the API claude.ai uses)
 and writes:
@@ -195,8 +185,8 @@ did not write the change checks it.
    It marks each finding MAJOR (the change misses something the task calls done, or
    breaks something that worked) or MINOR, and CONFIRMED (reproduced, or the failing
    lines are named) or PLAUSIBLE. Do not review tasks that report `failed` or `blocked`, and skip the step
-   when the user says so ("collect, no review"). The review of a cloud task also runs
-   on this machine, on the branch fetched from GitHub.
+   when the user says so ("collect, no review"). A cloud task has no branch to review:
+   `pull` it instead, and report what came back with `PULLED.md`.
 2. **Wait** for the reviews: `wait <name>-review ... --timeout 540`. (`wait` also takes
    cloud tasks: it waits while claude.ai says the session is running.) It prints the
    status line of every task when the named ones have reported, and starts with a
@@ -204,9 +194,8 @@ did not write the change checks it.
    still running then, report the rest now and say which are pending.
 3. **Send back what failed.** For each task whose newest review has a finding that is
    MAJOR and CONFIRMED, run `fix <name>` (always the task's own name, not a round's).
-   It starts a new round: a new session on the same branch (a local one in the task's
-   own worktree, a cloud one from its pushed branch) with the original brief and only
-   those findings. MINOR and PLAUSIBLE findings are never sent back: they are the
+   It starts a new local session in the task's own worktree, on the same branch, with
+   the original brief and only those findings. MINOR and PLAUSIBLE findings are never sent back: they are the
    user's call. Then `wait <name>-fix<N>`, `review <name>-fix<N>`, `wait` for that
    review, and repeat while the newest review still has MAJOR CONFIRMED findings. The
    helper stops after `max_fix_rounds` rounds (default 2, exit code 7): then the task
@@ -255,12 +244,11 @@ step 3 for one task.
 The user is about to close the laptop. Local sessions stop when it sleeps. Go through
 every local task that `status` shows as `running`:
 
-**Can move to the cloud** (GitHub remote, not marked `needs_local` in
-`~/.claude/dispatch/tasks.jsonl`):
+**Can move to the cloud** (not marked `needs_local` in `~/.claude/dispatch/tasks.jsonl`):
 
 1. Ask the session to hand off: send it the message `Hand off now, as your brief
    describes.` (SendMessage to the session's name, if that tool is available). It
-   commits its work in progress, pushes its branch and writes a report with
+   commits its work in progress to its branch and writes a report with
    `STATUS: handoff`. Wait for the report with `wait <name> --timeout 300`: a session
    only reads the message between two of its steps, and one step can take minutes.
    Read the report with `result <name>`. If it says nothing is left to do, the task is
@@ -268,12 +256,14 @@ every local task that `status` shows as `running`:
    moving.
 2. If there is no way to message it, or no report appears: `claude stop <id>`, then in
    its worktree (`<repo>/.claude/worktrees/<name>`) commit everything to its branch with
-   the message `wip: handoff` and push the branch. Never push the default branch.
-3. Start the continuation: `cloud --name <name>-cloud --base <its branch>`, with a brief
+   the message `wip: handoff`. Push nothing.
+3. Start the continuation from the worktree, which uploads it as it is:
+   `cloud --repo <repo>/.claude/worktrees/<name> --name <name>-cloud`, with a brief
    made of the original brief (`~/.claude/dispatch/briefs/<name>.md`, the part above the
    rules) plus the handoff report: what is done, what is left, what to try next.
 4. `claude stop <id>` if it is still running. Keep the local worktree until the cloud
-   task is collected.
+   task is pulled: `pull <name>-cloud --out <somewhere new>`, then the user decides what
+   to copy into the worktree.
 
 **A fix round** (`fix` in the `where` column) is handed off like a task. Its worktree is
 its task's (`<repo>/.claude/worktrees/<task>`, the `cwd` in `tasks.jsonl`).
@@ -348,8 +338,8 @@ prints the command).
   user, and push first or use `--no-worktree`.
   The helper lists `.claude/worktrees/` in the repo's `.git/info/exclude`, so the
   worktrees do not show up in `git status`.
-- A cloud session works on a clone from GitHub, or on the uploaded folder. It never
-  sees local files outside it, or secrets.
+- A cloud session works on the uploaded folder. It never sees local files outside it,
+  or secrets.
   It runs on the config's `cloud_environment`, or on the one given with
   `--environment` for that task (`envs` lists them). The environment's setup script runs before every
   task, so a heavy one delays them all: pick the lightest environment that has what the

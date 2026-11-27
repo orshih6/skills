@@ -22,16 +22,15 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
 
 - **`/dispatch <tasks>`** writes a self-contained brief for each task and starts one
   session per task: `claude --bg` in its own git worktree, or `claude --cloud` when the
-  repo is on GitHub and the task needs nothing from your machine.
+  task needs nothing from your machine. A cloud task never uses GitHub: the folder is
+  uploaded as it is (uncommitted changes too), and `pull` brings the work back.
 - **`status`** shows one line per task. For a cloud task it asks claude.ai what the
-  session is doing, through the API `claude --teleport` uses: running (with its own
-  one-line status), waiting for you, failed, blocked, or stopped with nothing pushed.
-  Its pull request, when there is one, is still the final report. Without the CLI's
-  login only GitHub is read, and a task with nothing there after 20 minutes shows as
-  `quiet`. `wait` waits for running cloud sessions too.
+  session is doing, through the API `claude --teleport` uses: starting, running (with
+  its own one-line status), waiting for you, failed, blocked or done. `wait` waits for
+  cloud sessions too.
 - **`sessions`** lists every cloud session on your account, as `claude --teleport` does,
   and **`adopt <id>`** makes dispatch track one it did not start, so `status`, `wait`,
-  `result` and `review` work on it too.
+  `result` and `pull` work on it too.
 - **`pull <name|id>`** brings a cloud session's files to your machine from its history,
   with no GitHub: the files it sent (byte for byte) and the files it wrote or edited.
   Teleport cannot do this for a session that never pushed: it fetches code from GitHub.
@@ -60,7 +59,7 @@ branch either, unless the task asks for it. It reports in a fixed shape that
 the manager reads instead of the session's log.
 
 Needs Claude Code 2.1 or newer (`claude --bg`, `claude --cloud`), `git`, Python 3, and
-`gh` for reading cloud results. State is kept in `~/.claude/dispatch/`.
+`gh` only for sessions adopted from GitHub. State is kept in `~/.claude/dispatch/`.
 
 ### Config
 

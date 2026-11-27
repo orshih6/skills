@@ -990,6 +990,11 @@ def cloud_checks(e):
         same((rows["upped"][1], rows["upped"][3]),
              ("done", "sub added, tests pass; `pull upped` brings its files"), "an uploaded task that finished")
         refused(e.d("review", "upped"), "no GitHub branch", "review of an uploaded task")
+        live["cse_07"] = cloud_session("cse_07", "idle")  # created, first turn not ended
+        rows, _ = e.status()
+        same(rows["upped"][1], "starting", "an uploaded task before its first turn ends")
+        _, out = e.status(("wait", "upped", "--timeout", "0"))
+        same(out.splitlines()[0], "still running after 0s: upped", "wait waits for a starting session")
 
         r = e.d("result", "unpushed")
         same(r.returncode, 0, f"result exit code ({r.stderr.strip()})")

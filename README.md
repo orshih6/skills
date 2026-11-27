@@ -62,8 +62,24 @@ branch, merge, deploy, spend money or message anyone. A local session does not p
 branch either, unless the task asks for it. It reports in a fixed shape that
 the manager reads instead of the session's log.
 
-Needs Claude Code 2.1 or newer (`claude --bg`, `claude --cloud`), `git`, Python 3, and
-`gh` only for sessions adopted from GitHub. State is kept in `~/.claude/dispatch/`.
+Needs Claude Code 2.1 or newer (`claude --bg`, `claude --cloud`), `git`, Python 3, a
+claude.ai login for cloud tasks, and `gh` only for sessions adopted from GitHub. Each
+repository must be trusted once: run `claude` in it and accept the prompt. State is kept
+in `~/.claude/dispatch/`.
+
+**Undocumented parts.** Local tasks use only documented commands. The cloud parts rely on
+things Claude Code does not document, found by reading its CLI, so an update can break
+them: the session API behind `status`, `wait`, `result`, `sessions` and `adopt`
+(`/v1/code/sessions`, the one `claude --teleport` uses), the event and file routes behind
+`pull`, the environment list behind `envs` (the one `/remote-env` uses), and the
+`CCR_FORCE_BUNDLE` switch that makes `claude --cloud` upload a folder instead of cloning
+it from GitHub. They use the claude CLI's own claude.ai login and never print it. Tested
+with Claude Code 2.1.332. If one breaks, local tasks still work.
+
+**Local or cloud.** The manager decides from the task: anything that needs this machine
+(secrets, a VPN or cluster, a signed-in browser, local files) stays local. It cannot know
+for sure that a task needs none of that, so list repositories that must never leave the
+machine in `local_only`: the helper refuses to send those to the cloud.
 
 ### Config
 
@@ -95,3 +111,7 @@ ln -s "$PWD/skills/skills/dispatch" ~/.claude/skills/dispatch
 ```
 
 Copying the skill directory works too.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

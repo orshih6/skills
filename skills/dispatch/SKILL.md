@@ -1,7 +1,7 @@
 ---
 name: dispatch
 description: Run tasks in other Claude Code sessions (local background sessions or cloud sessions) and manage them from this one, so the work does not fill this session's context. Use when the user wants to dispatch, delegate or fan out tasks to separate sessions, run something in the background or in the cloud, check on or collect dispatched work, or move running work to the cloud before closing the laptop ("dispatch these", "run this in the cloud", "how are my sessions doing", "I have to leave, hand it off").
-argument-hint: "<tasks> | status | collect | handoff"
+argument-hint: "<tasks> | status | collect | review <name> | handoff"
 ---
 
 # dispatch
@@ -16,6 +16,8 @@ Everything goes through one helper:
 D="${CLAUDE_SKILL_DIR}/scripts/dispatch.py"   # scripts/ next to this file
 python3 $D local  --repo <dir> --name <name> --brief-file <file> [--needs-local] [--no-worktree]
 python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch>]
+python3 $D review <name>
+python3 $D wait   [<name> ...] [--timeout <seconds>]
 python3 $D status
 python3 $D result <name>
 python3 $D forget <name>
@@ -79,12 +81,37 @@ Run `status` and show its lines as a table. States:
 
 ## `/dispatch collect`
 
-For each task that is no longer running, run `result <name>` and give the user two or
-three lines: what changed, branch or pull request, whether tests passed, and anything
-they must decide. Then offer to clean up the collected tasks: `claude rm <id>` removes a
-local session and its worktree (it refuses when the worktree holds unpushed work; do not
-force it), and `forget <name>` drops the task from the list. Never merge a branch or
-pull request yourself.
+A session's own report says what it believes. Before the user reads it, a session that
+did not write the change checks it.
+
+1. **Review.** For each task that reports `done` and has no `<name>-review` task yet,
+   run `review <name>`. It starts a new local session in its own worktree. That session
+   gets the original brief and the branch's diff, not the writer's report or reasoning,
+   and it marks each finding CONFIRMED (reproduced, or the failing lines are named) or
+   PLAUSIBLE. Do not review tasks that report `failed` or `blocked`, and skip the step
+   when the user says so ("collect, no review"). The review of a cloud task also runs
+   on this machine, on the branch fetched from GitHub.
+2. **Wait** for the reviews: `wait <name>-review ... --timeout 540`. If some are still
+   running when it returns, report the rest now and say which reviews are pending.
+3. **Report.** Run `result <name>` and `result <name>-review` for each task and give the
+   user the tasks in order of the review's `RISK`, highest first:
+   - `high`, or any CONFIRMED finding: what changed, branch or pull request, each
+     confirmed finding with its file and line, and what the user must decide. Say that
+     a person should read this one.
+   - `normal`: two or three lines, and the PLAUSIBLE findings named as unconfirmed.
+   - `low` and `clean`: one line.
+
+   When the review's checks disagree with the writer's `TESTS` line, say so first.
+4. **Findings are the user's call.** Do not fix them yourself and do not start a fix
+   without being asked. If the user wants one, dispatch a new task whose brief names
+   the branch to continue and quotes the confirmed findings.
+5. **Clean up** when the user agrees: `claude rm <id>` removes a local session and its
+   worktree (it refuses when the worktree holds unpushed work; do not force it), and
+   `forget <name>` drops a task from the list. Do the same for the review tasks.
+
+Never merge a branch or pull request yourself, whatever the review says.
+
+`/dispatch review <name>` runs steps 1 to 3 for one task.
 
 ## `/dispatch handoff`
 
@@ -106,6 +133,9 @@ every local task that `status` shows as `running`:
    rules) plus the handoff report: what is done, what is left, what to try next.
 4. `claude stop <id>` if it is still running. Keep the local worktree until the cloud
    task is collected.
+
+**A review** (`review` in the `where` column): stop it with `claude stop <id>` and
+`forget` it. It is short, and `collect` starts it again later.
 
 **Must stay on this machine**: do not stop it. Tell the user it only keeps running while
 the computer is awake, and give them the options:
@@ -146,7 +176,10 @@ prints the command).
   permission prompts, nothing but the brief's rules holds the session back, so keep the
   brief narrow and never dispatch a task whose point is to deploy, pay or send.
 - Sessions cost usage in parallel. Dispatching saves this session's context, not the
-  account's limit. Say so if the user dispatches many tasks at once.
+  account's limit. Say so if the user dispatches many tasks at once. A review is one
+  more session per task, and it counts towards `max_parallel`.
+- A review is a second opinion from one session, not a proof. `clean` means it found
+  nothing, and a PLAUSIBLE finding may be wrong.
 - A local task gets its own git worktree (`<repo>/.claude/worktrees/<name>`, branch
   `worktree-<name>`), so sessions in one repo cannot touch each other's changes. The
   worktree starts from the last commit: uncommitted changes in the repo are not in it.

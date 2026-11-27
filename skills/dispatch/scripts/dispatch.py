@@ -8,7 +8,10 @@ Standard library only. State lives in ~/.claude/dispatch/ (never in a repo):
   results/<name>.md  what each local session reports when it stops
   briefs/<name>.md   the exact brief each session was given
 
-Commands: local, cloud, status, result, forget. Run with -h for flags.
+A review is a local task named <name>-review: a new session that did not write the
+change reads the finished task's branch and reports a verdict.
+
+Commands: local, cloud, review, wait, status, result, forget. Run with -h for flags.
 """
 
 import argparse
@@ -76,6 +79,63 @@ If you cannot open a pull request, push the branch and add the same text as
 `DISPATCH_RESULT.md` in its last commit.
 """
 
+RULES_MARK = "## Rules for this dispatched session"
+
+REVIEW = """\
+# Review another session's work
+
+Another Claude Code session was given the task below and reports that it is finished.
+You did not write this change and you have not seen that session's reasoning or its
+report. Find out whether the change does what the task asked, and whether it breaks
+anything.
+
+## The task it was given
+
+{brief}
+
+## What to review
+
+The change is `{ref}` compared with `{base}` in this repository:
+
+    git diff --stat {base} {ref}
+    git diff {base} {ref}
+
+You are in your own git worktree. `git checkout --detach {ref}` puts the changed code
+in it, so you can run things without touching anyone else's files.
+
+## How
+
+- Read the diff, then the code around it. A diff does not show the callers.
+- Check each thing the task calls "done" yourself. Run the tests or the build that
+  cover the change if they can run here, and keep the last lines of the real output.
+- Look for: behaviour that changed and was not asked for, cases that now break for
+  existing users or existing data, tests that are missing or prove nothing, work left
+  half done, and secrets in the diff.
+- Try to prove each finding wrong before you report it: reproduce it, or follow the
+  code path from start to end. Mark it CONFIRMED when you reproduced it or can point
+  at the exact lines that fail, and PLAUSIBLE when you could not settle it.
+- Leave out style remarks and anything you cannot tie to a concrete failure.
+- Do not fix anything. Never edit the change, commit, push, merge, deploy or message
+  anyone. Do not ask questions and wait: nobody will answer.
+{extra}
+## Reporting (required, last step)
+
+Write your result to `{result}` in exactly this shape, then stop:
+
+    STATUS: done | failed
+    VERDICT: clean | findings
+    RISK: low | normal | high
+    CHECKS: <each command you ran and the last lines of its output, or not run and why>
+    FINDINGS:
+    1. CONFIRMED | PLAUSIBLE  <file>:<line>  <what goes wrong, and with which input>
+
+Write `FINDINGS: none` when there are none. RISK is about what the change touches, not
+about its quality: `high` for money, a database schema, sign-in or permissions, deleting
+data, or deploy configuration; `low` for documentation or UI text only; `normal` for
+the rest. Use `STATUS: failed` only when you could not review at all, and say why under
+CHECKS.
+{notify}"""
+
 
 def die(msg, code=1):
     print(f"error: {msg}", file=sys.stderr)
@@ -133,15 +193,47 @@ def check_common(args, tasks, cfg):
     brief = Path(args.brief_file).read_text().strip()
     if not brief:
         die("the brief is empty")
+    if args.where == "local":
+        check_limit(tasks, cfg)
+    return repo, brief
+
+
+def check_limit(tasks, cfg):
     limit = int(cfg.get("max_parallel", 4))
     live = sessions()
     running = [
         t for t in tasks
         if t["where"] == "local" and live.get(t["id"], {}).get("state") == "working"
     ]
-    if args.where == "local" and len(running) >= limit:
+    if len(running) >= limit:
         die(f"{len(running)} local tasks are already running (limit {limit}); wait or raise max_parallel")
-    return repo, brief
+
+
+def notify_text(cfg, name):
+    if not cfg.get("notify"):
+        return ""
+    return (
+        "\nAfter writing the file, notify the owner once with this command (skip it if "
+        "your project instructions already made you send a notification):\n\n    "
+        + cfg["notify"].replace("{name}", name) + "\n"
+    )
+
+
+def start_bg(repo, name, prompt, worktree):
+    """Start a local background session and return its short id."""
+    cmd = ["claude", "--bg", "-n", name]
+    if worktree:
+        cmd += ["-w", name]
+    cmd.append(prompt)
+    r = run(cmd, cwd=repo, timeout=120)
+    out = ANSI.sub("", r.stdout + r.stderr)
+    m = re.search(r"backgrounded\s*·\s*([0-9a-f]{6,})", out)
+    if not m:
+        if "not trusted" in out:
+            die(f"{repo} is not a trusted folder. The owner must run `claude` there once "
+                "and accept the trust prompt. Do not accept it for them.", 3)
+        die("could not start the session:\n" + out.strip()[-600:])
+    return m.group(1)
 
 
 def cmd_local(args):
@@ -152,13 +244,7 @@ def cmd_local(args):
     use_wt = is_git and not args.no_worktree
     branch = f"worktree-{args.name}" if use_wt else f"dispatch/{args.name}"
     result = RESULTS / f"{args.name}.md"
-    notify = ""
-    if cfg.get("notify"):
-        notify = (
-            "\nAfter writing the file, notify the owner once with this command (skip it if "
-            "your project instructions already made you send a notification):\n\n    "
-            + cfg["notify"].replace("{name}", args.name) + "\n"
-        )
+    notify = notify_text(cfg, args.name)
     extra = cfg.get("extra_rules", "")
     full = "\n\n".join([
         brief,
@@ -170,22 +256,12 @@ def cmd_local(args):
     (BRIEFS / f"{args.name}.md").write_text(full + "\n")
     result.unlink(missing_ok=True)
 
-    cmd = ["claude", "--bg", "-n", args.name]
-    if use_wt:
-        cmd += ["-w", args.name]
-    cmd.append(full)
-    r = run(cmd, cwd=repo, timeout=120)
-    out = ANSI.sub("", r.stdout + r.stderr)
-    m = re.search(r"backgrounded\s*·\s*([0-9a-f]{6,})", out)
-    if not m:
-        if "not trusted" in out:
-            die(f"{repo} is not a trusted folder. The owner must run `claude` there once "
-                "and accept the trust prompt. Do not accept it for them.", 3)
-        die("could not start the session:\n" + out.strip()[-600:])
+    base = git(repo, "rev-parse", "HEAD") if is_git else None
     task = {
-        "name": args.name, "where": "local", "id": m.group(1), "repo": str(repo),
-        "branch": branch if is_git else None, "worktree": use_wt,
-        "needs_local": bool(args.needs_local), "started": int(time.time()),
+        "name": args.name, "where": "local", "id": start_bg(repo, args.name, full, use_wt),
+        "repo": str(repo), "branch": branch if is_git else None, "base": base or None,
+        "worktree": use_wt, "needs_local": bool(args.needs_local),
+        "started": int(time.time()),
     }
     save_tasks(tasks + [task])
     print(f"started local {args.name} id={task['id']} repo={repo.name} branch={task['branch']}")
@@ -259,12 +335,94 @@ def cmd_cloud(args):
     url = re.search(r"https://claude\.ai/code/\S+", out)
     task = {
         "name": args.name, "where": "cloud", "id": m.group(1), "repo": str(repo),
-        "branch": branch, "url": url.group(0).split("?")[0] if url else None,
+        "branch": branch, "base": args.base or git(repo, "branch", "--show-current") or None,
+        "url": url.group(0).split("?")[0] if url else None,
         "started": int(time.time()),
     }
     save_tasks(tasks + [task])
     print(f"started cloud {args.name} id={task['id']} repo={repo.name} branch={branch}")
     print(f"view: {task['url']}")
+
+
+def resolves(repo, ref):
+    return bool(ref and git(repo, "rev-parse", "--verify", "--quiet", ref + "^{commit}"))
+
+
+def review_range(t, repo):
+    """The two commits a review compares: where the task's branch left its base, and its tip."""
+    if not t.get("branch"):
+        die(f"{t['name']} has no branch (its folder is not a git repository); there is nothing to diff")
+    cloud = t["where"] == "cloud"
+    if cloud:
+        run(["git", "-C", str(repo), "fetch", "--quiet", "origin", t["branch"]], timeout=120)
+    ref = f"origin/{t['branch']}" if cloud else t["branch"]
+    if not resolves(repo, ref):
+        die(f"the branch {ref} does not exist" + (" on GitHub yet" if cloud else "")
+            + f"; {t['name']} has nothing to review")
+    head = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    b = t.get("base")
+    for cand in ((f"origin/{b}", b) if cloud else (b,)) + (head, "origin/main", "main", "origin/master", "master"):
+        if resolves(repo, cand):
+            base = git(repo, "merge-base", cand, ref)
+            if base:
+                break
+    else:
+        die(f"could not find the commit {ref} started from")
+    tip = git(repo, "rev-parse", ref)
+    if base == tip:
+        die(f"{ref} has no commits of its own; {t['name']} has nothing to review")
+    return base[:12], ref
+
+
+def cmd_review(args):
+    cfg, tasks = load_config(), load_tasks()
+    t = next((t for t in tasks if t["name"] == args.name), None)
+    if not t:
+        die(f"no task named {args.name}")
+    if t.get("kind") == "review":
+        die(f"{args.name} is itself a review")
+    name = f"{args.name}-review"
+    if any(x["name"] == name for x in tasks):
+        die(f"{args.name} already has a review; `result {name}` shows it, `forget {name}` allows another")
+    repo = Path(t["repo"])
+    base, ref = review_range(t, repo)
+    check_limit(tasks, cfg)
+    bf = BRIEFS / f"{args.name}.md"
+    brief = bf.read_text().split(RULES_MARK)[0].strip() if bf.exists() else ""
+    if not brief:
+        die(f"the brief of {args.name} is missing ({bf}); a review needs to know what was asked")
+    extra = cfg.get("extra_rules", "")
+    result = RESULTS / f"{name}.md"
+    full = REVIEW.format(brief=brief, base=base, ref=ref, result=result,
+                         extra=extra + "\n" if extra else "", notify=notify_text(cfg, name))
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    (BRIEFS / f"{name}.md").write_text(full + "\n")
+    result.unlink(missing_ok=True)
+    task = {
+        "name": name, "where": "local", "kind": "review", "of": args.name,
+        "id": start_bg(repo, name, full, True), "repo": str(repo), "branch": None,
+        "worktree": True, "needs_local": True, "started": int(time.time()),
+    }
+    save_tasks(tasks + [task])
+    print(f"started review {name} id={task['id']} repo={repo.name} diff={base}..{ref}")
+
+
+def cmd_wait(args):
+    """Block until the named local tasks (default: all of them) have reported or stopped."""
+    tasks = [t for t in load_tasks() if t["where"] == "local"
+             and (not args.names or t["name"] in args.names)]
+    end = time.time() + args.timeout
+    while True:
+        live = sessions()
+        left = [t["name"] for t in tasks
+                if not (RESULTS / f"{t['name']}.md").exists()
+                and live.get(t["id"], {}).get("state") == "working"]
+        if not left or time.time() >= end:
+            break
+        time.sleep(10)
+    if left:
+        print(f"still running after {args.timeout}s: {', '.join(left)}")
+    cmd_status(args)
 
 
 def read_result(name):
@@ -273,8 +431,18 @@ def read_result(name):
         return None, ""
     text = f.read_text()
     m = re.search(r"^STATUS:\s*(\w+)", text, re.M)
+    status = m.group(1).lower() if m else "unknown"
+    v = re.search(r"^VERDICT:\s*(\w+)", text, re.M)
+    if v:  # a review: its note is the verdict, the risk and how many findings
+        r = re.search(r"^RISK:\s*(\w+)", text, re.M)
+        n = len(re.findall(r"^\s*\d+\.\s", text.split("FINDINGS:")[-1], re.M)) if "FINDINGS:" in text else 0
+        c = len(re.findall(r"^\s*\d+\.\s+CONFIRMED", text, re.M))
+        note = f"{v.group(1).lower()}, risk {r.group(1).lower() if r else 'unknown'}"
+        if n:
+            note += f", {n} finding{'s' if n != 1 else ''} ({c} confirmed)"
+        return status, note
     s = re.search(r"^SUMMARY:\s*(.+)", text, re.M)
-    return (m.group(1).lower() if m else "unknown"), (s.group(1).strip() if s else "")
+    return status, (s.group(1).strip() if s else "")
 
 
 def cloud_state(t):
@@ -318,7 +486,8 @@ def cmd_status(args):
                 state, note = "stopped-no-report", f"claude logs {t['id']}"
             else:
                 state, note = "gone", "session no longer listed and left no report"
-        print(f"{t['name']:<28} {t['where']:<5} {state:<20} {age:>4}m  {Path(t['repo']).name}  {note[:90]}")
+        where = "review" if t.get("kind") == "review" else t["where"]
+        print(f"{t['name']:<28} {where:<6} {state:<20} {age:>4}m  {Path(t['repo']).name}  {note[:90]}")
 
 
 def cmd_result(args):
@@ -362,8 +531,16 @@ def main():
         s.set_defaults(fn=fn)
 
     sub.add_parser("status", help="one line per task").set_defaults(fn=cmd_status)
-    for name, fn in (("result", cmd_result), ("forget", cmd_forget)):
-        s = sub.add_parser(name)
+    s = sub.add_parser("wait", help="block until local tasks report, then print status")
+    s.add_argument("names", nargs="*", help="task names (default: every local task)")
+    s.add_argument("--timeout", type=int, default=540, help="seconds to wait at most")
+    s.set_defaults(fn=cmd_wait)
+    for name, fn, text in (
+        ("review", cmd_review, "start a new session that reviews a finished task's branch"),
+        ("result", cmd_result, "print a task's report"),
+        ("forget", cmd_forget, "drop a task from the list"),
+    ):
+        s = sub.add_parser(name, help=text)
         s.add_argument("name")
         s.set_defaults(fn=fn)
 

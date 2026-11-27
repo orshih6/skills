@@ -905,11 +905,13 @@ def envs_checks(e):
                 A.environment = want
                 return mod.pick_environment(A(), cfg or {})[:2]
 
-            same(pick("vpn"), ("vpn", "env_vpn1"), "a claude.ai name, any case")
-            same(pick("light", {"environments": {"light": "env_x"}}), ("light", "env_x"),
-                 "a config name wins over a claude.ai name")
-            same(pick("env_direct"), ("env_direct", "env_direct"), "an id needs no lookup")
-            for want in ("old", "nope"):  # archived, or not there
+            same(pick("vpn"), ("'VPN'", "env_vpn1"), "a claude.ai name, any case")
+            same(pick("Fast", {"environments": {"fast": "env_light1"}}), ("'Light'", "env_light1"),
+                 "a config name, any case, whose id this login has")
+            same(pick("light", {"environments": {"light": "env_x"}}), ("'Light'", "env_light1"),
+                 "a config id of another login gives way to the claude.ai name")
+            same(pick("env_vpn1"), ("'VPN'", "env_vpn1"), "an id this login has")
+            for want in ("old", "nope", "env_direct"):  # archived, not there, another login's id
                 try:
                     pick(want)
                     raise Failure(f"{want!r} was accepted")
@@ -998,7 +1000,6 @@ def cloud_checks(e):
         rows, _ = e.status()
         same((rows["upped"][1], rows["upped"][3]),
              ("done", "sub added, tests pass; `pull upped` brings its files"), "an uploaded task that finished")
-        refused(e.d("review", "upped"), "no GitHub branch", "review of an uploaded task")
         live["cse_07"] = cloud_session("cse_07", "idle")  # created, first turn not ended
         live["cse_07"]["status_bucket"] = "completed"  # claude.ai can say so before it starts
         rows, _ = e.status()
@@ -1209,6 +1210,73 @@ def cloud_review_checks(e):
         e.config()
         r = e.d("review", "alpha", "--local")
         has(r.stdout, "on this machine", "review --local")
+    finally:
+        srv.shutdown()
+
+
+@check("review: a cloud task's pulled work goes on a local branch, then review and fix work")
+def import_checks(e):
+    import io
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = b"print('packed')\n"
+        info = tarfile.TarInfo("tools/packed.py")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    history = [
+        use("w1", "Write", file_path="/home/user/repo/shop/price.py", content="PRICE = 5\n"),
+        res("w1"),
+        use("e1", "Edit", file_path="/home/user/repo/README.md", old_string="README.md", new_string="Shop"),
+        res("e1", originalFile="README.md\n"),
+        use("s1", "SendUserFile", files=["/home/user/repo/dispatch-up.tar.gz"]),
+        res("s1", attachments=[{"file_uuid": "f-tar", "path": "/home/user/repo/dispatch-up.tar.gz",
+                                "size": len(buf.getvalue())}]),
+    ]
+    live = {"cse_09": cloud_session("cse_09", "running")}
+    srv = fake_api([], live, {"cse_09": history}, {"f-tar": buf.getvalue()})
+    try:
+        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"):
+            e.env.pop(k, None)
+        e.env["DISPATCH_API_URL"] = f"http://127.0.0.1:{srv.server_address[1]}"
+        (e.dir / ".claude").mkdir()
+        (e.dir / ".claude" / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "tok-123", "expiresAt": int(time.time() + 3600) * 1000}}))
+        (e.dir / ".claude.json").write_text(json.dumps({"oauthAccount": {"organizationUuid": "org-9"}}))
+        base = e.git("rev-parse", "HEAD")
+        up = cloud_task("up", 9)
+        up.update(repo=str(e.repo), upload=True, branch=None, base=base)
+        (e.home / "tasks.jsonl").write_text(json.dumps(up) + "\n")
+        (e.home / "briefs").mkdir()
+        (e.home / "briefs" / "up.md").write_text(BRIEF + "\n\n## Rules for this dispatched session\n")
+        refused(e.d("review", "up"), "still running", "review of a cloud task at work")
+        live["cse_09"] = cloud_session("cse_09", "idle", "completed")
+        e.config(review_in_cloud=False)
+        r = e.d("review", "up")
+        same(r.returncode, 0, f"review of a finished cloud task ({r.stderr.strip()})")
+        has(r.stdout, "imported up: 3 files on the branch cloud-up", "import output")
+        wt = e.repo / ".claude" / "worktrees" / "up"
+        same((wt / "shop" / "price.py").read_text(), "PRICE = 5\n", "a written file")
+        same((wt / "README.md").read_text(), "Shop\n", "an edited file")
+        same((wt / "tools" / "packed.py").read_text(), "print('packed')\n", "a file from the archive")
+        expect(not (wt / "dispatch-up.tar.gz").exists(), "the archive was left in the worktree")
+        same(e.git("rev-parse", "cloud-up~1"), base, "the branch starts at the uploaded commit")
+        same(e.git("status", "--porcelain", cwd=wt), "", "everything pulled is committed")
+        t = e.task("up")
+        same((t["branch"], t["imported"]), ("cloud-up", True), "the task now has its branch")
+        has(r.stdout, f"diff={base[:12]}..cloud-up", "the review compares the pulled work")
+        e.report("up-review", REVIEW_FINDINGS)
+        (e.fake / "next_id").write_text("abc12350")
+        r = e.d("fix", "up")
+        same(r.returncode, 0, f"fix of an imported cloud task ({r.stderr.strip()})")
+        same(Path(e.starts()[-1]["cwd"]).resolve(), wt.resolve(), "its round runs in that worktree")
+        e.agents(abc12350="done")
+        e.d("forget", "up-fix1")
+        e.d("forget", "up-review")
+        r = e.d("clean", "up")
+        same(r.returncode, 0, f"clean of an imported cloud task ({r.stderr.strip()})")
+        expect(not wt.exists(), "its worktree is gone")
+        same(e.git("rev-parse", "--verify", "cloud-up") != "", True, "its branch stays")
     finally:
         srv.shutdown()
 

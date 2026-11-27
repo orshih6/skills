@@ -24,6 +24,7 @@ import select
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.parse
@@ -465,26 +466,44 @@ def pick_environment(args, cfg):
 
     --environment wins, then the config's cloud_environment. Either may be a name from
     the config's `environments` map, an id, or the name the environment has on
-    claude.ai/code (looked up live). Nothing chosen: the account's default.
+    claude.ai/code (any case). Every id is checked against the environments of the
+    login `claude --cloud` will use: a config id from another login (another
+    CLAUDE_CONFIG_DIR) is passed over for the claude.ai name, and an id this login does
+    not have stops the start, because the CLI would quietly run somewhere else. Nothing
+    chosen: the account's default, whichever the CLI picks.
     """
     want = getattr(args, "environment", None) or cfg.get("cloud_environment")
     if not want:
         return None, None, []
-    envs = cfg.get("environments", {})
-    env_id = envs.get(want, want)
-    if not env_id.startswith(("env_", "ccpool_")):
+    try:
         live = [e for e in cloud_environments() if e["state"] != "archived"]
+    except SystemExit:  # claude.ai not reachable: trust what was given
+        live = None
+    ids = {e["id"]: e["name"] for e in live or []}
+    mapped = {k.casefold(): v for k, v in cfg.get("environments", {}).items()}
+    env_id = None
+    for cand in (mapped.get(want.casefold()), want if want.startswith(("env_", "ccpool_")) else None):
+        if cand and (live is None or cand in ids):
+            env_id = cand
+            break
+    if not env_id and live is not None:
         hits = [e for e in live if e["name"].casefold() == want.casefold()]
-        if len(hits) != 1:
-            names = sorted(set(envs) | {e["name"] for e in live})
-            die(f"{'several environments are' if hits else 'no environment is'} named "
-                f"{want!r}. Use an id (env_... or ccpool_...) or one of: "
-                f"{', '.join(repr(n) for n in names) or 'none'}. `envs` lists them.")
-        env_id = hits[0]["id"]
+        if len(hits) == 1:
+            env_id = hits[0]["id"]
+        else:
+            names = sorted({e["name"] for e in live})
+            die(f"{'several environments are' if hits else 'this claude login has no environment'} "
+                f"named {want!r}" + (f" (the config maps it to {mapped[want.casefold()]}, which belongs "
+                                     "to another login)" if want.casefold() in mapped else "")
+                + f". This login has: {', '.join(repr(n) for n in names) or 'none'}. "
+                "`envs` lists them; pass --environment, or fix cloud_environment.")
+    if not env_id:
+        env_id = mapped.get(want.casefold(), want)
+    label = f"{ids[env_id]!r}" if env_id in ids else want
     if env_id.startswith("ccpool_"):  # a self-hosted environment has its own flag
-        return want, env_id, ["--environment", env_id]
+        return label, env_id, ["--environment", env_id]
     # a hosted environment is chosen through the setting the CLI reads its default from
-    return want, env_id, ["--settings", json.dumps({"remote": {"defaultEnvironmentId": env_id}})]
+    return label, env_id, ["--settings", json.dumps({"remote": {"defaultEnvironmentId": env_id}})]
 
 
 def session_title(name, cfg=None):
@@ -642,16 +661,95 @@ def resolves(repo, ref):
     return bool(ref and git(repo, "rev-parse", "--verify", "--quiet", ref + "^{commit}"))
 
 
+def import_cloud(t):
+    """Put a finished uploaded cloud task's work on a local branch, so `review` and `fix`
+    treat it like a local task. Changes t; the caller saves it.
+
+    The branch `cloud-<name>` starts at the commit the folder was uploaded from, in a
+    worktree at `.claude/worktrees/<name>`, and gets one commit: every file the session
+    sent (a `dispatch-<name>.tar.gz` is unpacked) or wrote, under its path in the folder.
+    Files the session deleted, and uncommitted changes that were uploaded, are not told
+    apart: the diff shows what the session's files hold.
+    """
+    repo, name = Path(t["repo"]), t["name"]
+    base = t.get("base")
+    if not base or not resolves(repo, base):
+        die(f"the commit {name} was uploaded from ({base or 'unknown'}) is not in {repo}; "
+            f"`pull {name}` and compare by hand")
+    s = CloudSessions().get(t["id"])
+    if not isinstance(s, dict):
+        die(f"could not read {name} from claude.ai")
+    if session_busy(session_facts(s)):
+        die(f"{name} is still running; `wait {name}` first")
+    token, org = claude_login()
+    sent, written, skipped = session_files(session_events(t["id"], token, org))
+    report = re.compile(r"/dispatch-report-[^/]*\.md$")
+
+    def rel(path):  # /home/user/<folder>/<path> -> <path>
+        parts = path.split("/")
+        return "/".join(parts[4:]) if path.startswith("/home/user/") and len(parts) > 4 else None
+
+    wt = repo / ".claude" / "worktrees" / name
+    branch = f"cloud-{name}"
+    if wt.exists() or resolves(repo, branch):
+        die(f"{wt} or the branch {branch} already exists; remove them or `forget` and re-adopt")
+    hide_worktrees(repo)
+    r = run(["git", "-C", str(repo), "worktree", "add", "-q", "-b", branch, str(wt), base])
+    if r.returncode != 0:
+        die(f"could not make the worktree: {r.stderr.strip()}")
+    root = wt.resolve()
+    placed = 0
+    for path, text in written.items():
+        rp = rel(path)
+        if rp and path not in sent and not report.search(path):
+            target = (wt / rp).resolve()
+            if target.is_relative_to(root) and ".git" not in Path(rp).parts:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text)
+                placed += 1
+    for path, f in sent.items():
+        rp = rel(path)
+        if not rp or report.search(path):
+            continue
+        target = (wt / rp).resolve()
+        if not target.is_relative_to(root) or ".git" in Path(rp).parts:
+            continue
+        if not download(f["uuid"], token, org, target, f.get("size")):
+            die(f"could not download {path}; the worktree {wt} is left as it is")
+        if rp == f"dispatch-{name}.tar.gz":
+            with tarfile.open(target) as tar:
+                members = tar.getmembers()
+                bad = [m.name for m in members if not (wt / m.name).resolve().is_relative_to(root)
+                       or m.issym() or m.islnk() or ".git" in Path(m.name).parts]
+                if bad:
+                    die(f"{path} holds paths that leave the folder or are links: {bad[:5]}")
+                tar.extractall(wt, members=[m for m in members if m.isfile() or m.isdir()])
+            target.unlink()
+        placed += 1
+    if not placed:
+        die(f"{name} sent and wrote no files; there is nothing to review. Its worktree {wt} is empty of changes.")
+    git(wt, "add", "-A")
+    env = None
+    if not git(wt, "config", "user.email"):
+        env = {**os.environ, "GIT_AUTHOR_NAME": "dispatch", "GIT_AUTHOR_EMAIL": "dispatch@localhost",
+               "GIT_COMMITTER_NAME": "dispatch", "GIT_COMMITTER_EMAIL": "dispatch@localhost"}
+    r = subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m",
+                        f"dispatch: work of cloud task {name}\n\nPulled from {t.get('url')}"],
+                       capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        die(f"could not commit the pulled files: {(r.stdout + r.stderr).strip()[-400:]}")
+    t.update(branch=branch, worktree=True, imported=True)
+    print(f"imported {name}: {placed} file{'s' if placed != 1 else ''} on the branch {branch} "
+          f"in {wt}" + (f" ({len(skipped)} edits could not be rebuilt)" if skipped else ""))
+
+
 def review_range(t, repo):
     """The two commits a review compares: where the task's branch left its base, and its tip."""
-    if t.get("upload"):
-        die(f"{t['name']} ran on an uploaded folder with no GitHub branch, so there is no diff "
-            f"to review. `pull {t['name']}` brings its files; compare them with the folder.")
     if not t.get("branch"):
         die(f"{t['name']} has no branch "
             + ("(claude.ai names none for this session yet)" if t["where"] == "cloud"
                else "(its folder is not a git repository)") + "; there is nothing to diff")
-    cloud = t["where"] == "cloud"
+    cloud = t["where"] == "cloud" and not t.get("upload")  # a GitHub session's branch
     if cloud:
         s = CloudSessions().get(t["id"])
         own = session_facts(s)["branch"] if isinstance(s, dict) else None
@@ -691,6 +789,9 @@ def cmd_review(args):
     if any(x["name"] == name for x in tasks):
         die(f"{args.name} already has a review; `result {name}` shows it, `forget {name}` allows another")
     repo = Path(t["repo"])
+    if t.get("upload") and not t.get("branch"):
+        import_cloud(t)
+        save_tasks(tasks)
     base, ref = review_range(t, repo)
     check_limit(tasks, cfg)
     bf = BRIEFS / f"{args.name}.md"
@@ -805,9 +906,9 @@ def cmd_fix(args):
     if t.get("kind") in ("review", "fix"):
         die(f"{args.name} is a {t['kind']}; give the name of the task it belongs to "
             f"({t.get('of')})")
-    if t["where"] == "cloud":
-        die(f"{args.name} is a cloud task: it has no branch here to review or continue. "
-            f"`pull {args.name}`, then dispatch a new task that quotes what is wrong.")
+    if t["where"] == "cloud" and not t.get("imported"):
+        die(f"{args.name} is a cloud task that has not been reviewed here; `review {args.name}` "
+            "first (it brings the work to a local branch)")
     last, done = latest_round(tasks, args.name)
     rnd = done + 1  # this fix round's number
     limit = int(cfg.get("max_fix_rounds", 2))
@@ -1126,8 +1227,22 @@ def cmd_clean(args):
     t = next((t for t in tasks if t["name"] == args.name), None)
     if not t:
         die(f"no task named {args.name}")
-    if t["where"] != "local":
+    if t["where"] != "local" and not t.get("imported"):
         die(f"{args.name} is a cloud task; there is nothing on this machine to remove. Use `forget`.")
+    if t.get("imported"):  # its worktree holds pulled files; the session lives on claude.ai
+        wt = Path(t["repo"]) / ".claude" / "worktrees" / args.name
+        if wt.is_dir():
+            junk = JUNK + tuple(load_config().get("leftovers", []))
+            real = [l[3:] for l in git(wt, "status", "--porcelain").splitlines() if not l[3:].endswith(junk)]
+            if real:
+                die(f"{wt} holds changes that are not committed:\n  " + "\n  ".join(real)
+                    + "\nAsk the owner what to do with them. Nothing was removed.", 6)
+            r = run(["git", "-C", t["repo"], "worktree", "remove", "--force", str(wt)])
+            if r.returncode != 0:
+                die(f"could not remove {wt}: {r.stderr.strip()}", 6)
+        save_tasks([x for x in tasks if x["name"] != args.name])
+        print(f"removed {args.name}: worktree gone; its pulled work is on the branch {t['branch']}")
+        return
     if sessions().get(t["id"], {}).get("state") == "working" and not (RESULTS / f"{args.name}.md").exists():
         die(f"{args.name} is still running; `claude stop {t['id']}` first if you mean it")
     wt = Path(t["repo"]) / ".claude" / "worktrees" / args.name

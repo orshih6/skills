@@ -38,7 +38,10 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
   own login and an undocumented API, so a Claude Code update may break it.
 - **`collect`** first has each finished task reviewed by a new session that did not
   write it and has not seen its report, then gives the results in order of risk, with
-  the findings the reviewer could confirm. `/dispatch review <name>` does it for one task.
+  the findings the reviewer could confirm. A task whose review confirms a major problem
+  goes back to a new session on the same branch with only those findings, and is
+  reviewed again, up to `max_fix_rounds` times (default 2). `/dispatch review <name>`
+  and `/dispatch fix <name>` do it for one task.
 - After `collect`, the finished sessions and their worktrees are removed once you
   agree. A local task's commits stay on its branch; nothing is pushed or merged for you.
 - **`handoff`** is for when you have to leave: tasks that can run in the cloud are pushed

@@ -503,6 +503,57 @@ def review_refusals(e):
     same(len(e.starts()), 2, "sessions started in all (the task and its first review)")
 
 
+@check("fix: sends MAJOR CONFIRMED findings back to a new round, up to max_fix_rounds")
+def fix_checks(e):
+    e.started("alpha")
+    e.reviewed("alpha")  # a commit on worktree-alpha, and its review abc12346
+    wt = e.repo / ".claude" / "worktrees" / "alpha"
+    e.git("worktree", "add", "-q", str(wt), "worktree-alpha")
+    e.agents(abc12345="done", abc12346="done")
+
+    refused(e.d("fix", "alpha"), "has no finished review", "fix before the review reported")
+    e.report("alpha-review", REVIEW_CLEAN)
+    refused(e.d("fix", "alpha"), "nothing MAJOR and CONFIRMED", "fix after a clean review", code=7)
+    e.report("alpha-review", REVIEW_FINDINGS)
+    refused(e.d("fix", "alpha-review"), "is a review", "fix of a review")
+
+    (e.fake / "next_id").write_text("abc12347")
+    r = e.d("fix", "alpha")
+    same(r.returncode, 0, f"fix exit code ({r.stderr.strip()})")
+    has(r.stdout, "started fix alpha-fix1 id=abc12347", "fix output")
+    has(r.stdout, "round 2 of 3, 1 finding", "fix output: round and findings")
+    start = e.starts()[-1]
+    same(Path(start["cwd"]).resolve(), wt.resolve(), "the round runs in the task's own worktree")
+    expect("-w" not in start["args"], "the round was given a new worktree")
+    prompt = start["args"][-1]
+    has(prompt, "Show the price of each product", "the round's brief holds the task")
+    has(prompt, "MAJOR  CONFIRMED  shop/table.py:14", "the round's brief holds the confirmed finding")
+    expect("PLAUSIBLE" not in prompt.split("## Rules")[0], "an unconfirmed finding was sent back")
+    has(prompt, "branch `worktree-alpha`", "the round works on the task's branch")
+    t = e.task("alpha-fix1")
+    same((t["kind"], t["of"], t["round"], t["branch"], t["base"]),
+         ("fix", "alpha", 1, "worktree-alpha", e.task("alpha")["base"]), "the round's task line")
+    rows, _ = e.status()
+    same(rows["alpha-fix1"][0], "fix", "status shows a round as fix")
+
+    refused(e.d("fix", "alpha"), "has no finished review", "a new round before this one is reviewed")
+    e.agents(abc12347="done")
+    e.commit_on("tmp", "x.txt")  # (keep main's checkout as it was)
+    e.commit("fix1.txt", cwd=wt)
+    e.report("alpha-fix1", DONE)
+    (e.fake / "next_id").write_text("abc12348")
+    r = e.d("review", "alpha-fix1")
+    same(r.returncode, 0, f"review of a round ({r.stderr.strip()})")
+    has(e.brief_of("alpha-fix1-review"), "A review sent this work back", "its review reads the round's brief")
+    e.report("alpha-fix1-review", REVIEW_FINDINGS)
+    (e.fake / "next_id").write_text("abc12349")
+    r = e.d("fix", "alpha")
+    same(r.returncode, 0, f"second round ({r.stderr.strip()})")
+    has(r.stdout, "alpha-fix2", "second round's name")
+    e.config(max_fix_rounds=2)
+    refused(e.d("fix", "alpha"), "already sent back 2 times", "a round beyond max_fix_rounds", code=7)
+
+
 # status and wait -----------------------------------------------------------------------
 
 

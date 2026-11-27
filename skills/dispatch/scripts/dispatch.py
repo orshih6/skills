@@ -11,7 +11,7 @@ Standard library only. State lives in ~/.claude/dispatch/ (never in a repo):
 A review is a local task named <name>-review: a new session that did not write the
 change reads the finished task's branch and reports a verdict.
 
-Commands: local, cloud, review, wait, status, envs, sessions, adopt, result, clean, forget. Run with -h for flags.
+Commands: local, cloud, review, fix, wait, status, envs, sessions, adopt, result, clean, forget. Run with -h for flags.
 """
 
 import argparse
@@ -689,6 +689,131 @@ def cmd_review(args):
     print(f"started review {name} id={task['id']} repo={repo.name} diff={base}..{ref}")
 
 
+FIX = """\
+## A review sent this work back
+
+This is round {round} of the task above. The work so far is on the branch `{branch}`
+and is already checked out here{where}. A review by another session, which ran the
+checks itself, found these problems:
+
+{findings}
+
+Fix each of them on that branch. Keep what already works, and do not redo the task
+from the start. For each problem, add or change a test that fails without your fix
+when that is possible. Then run the checks the task asks for, and the ones the review
+ran, and report.
+"""
+
+CONFIRMED_MAJOR = re.compile(r"^\s*\d+\.\s+MAJOR\s+CONFIRMED\b.*$", re.M)
+
+
+def latest_round(tasks, name):
+    """The newest work on a task: (the task or its last fix round, fix rounds so far)."""
+    fixes = [t for t in tasks if t.get("kind") == "fix" and t.get("of") == name]
+    if not fixes:
+        return next(t for t in tasks if t["name"] == name), 0
+    last = max(fixes, key=lambda t: t["round"])
+    return last, last["round"]
+
+
+def cmd_fix(args):
+    """Send a task back to a new session with its review's MAJOR CONFIRMED findings."""
+    cfg, tasks = load_config(), load_tasks()
+    t = next((t for t in tasks if t["name"] == args.name), None)
+    if not t:
+        die(f"no task named {args.name}")
+    if t.get("kind") in ("review", "fix"):
+        die(f"{args.name} is a {t['kind']}; give the name of the task it belongs to "
+            f"({t.get('of')})")
+    last, done = latest_round(tasks, args.name)
+    rnd = done + 1  # this fix round's number
+    limit = int(cfg.get("max_fix_rounds", 2))
+    if done >= limit:
+        die(f"{args.name} was already sent back {done} times (max_fix_rounds {limit}); "
+            "the owner decides what happens now", 7)
+    review = f"{last['name']}-review"
+    rstat, _ = read_result(review)
+    if not rstat:
+        die(f"{last['name']} has no finished review yet (`review {last['name']}`, then "
+            f"`wait {review}`)")
+    text = (RESULTS / f"{review}.md").read_text()
+    findings = CONFIRMED_MAJOR.findall(text)
+    if not findings:
+        die(f"the review {review} found nothing MAJOR and CONFIRMED; there is nothing to "
+            "send back. MINOR or PLAUSIBLE findings are the owner's call.", 7)
+    bf = BRIEFS / f"{args.name}.md"
+    brief = bf.read_text().split(RULES_MARK)[0].strip() if bf.exists() else ""
+    if not brief:
+        die(f"the brief of {args.name} is missing ({bf})")
+    name = f"{args.name}-fix{rnd}"
+    if any(x["name"] == name for x in tasks):
+        die(f"a task named {name} already exists; `forget` it to start the round again")
+    found = "\n".join("    " + f.strip() for f in findings)
+    repo = Path(t["repo"])
+
+    if t["where"] == "cloud":
+        prev = last
+        s = CloudSessions().get(prev["id"])
+        own = session_facts(s)["branch"] if isinstance(s, dict) else None
+        pr = cloud_pr(prev, own)
+        branch = pr["headRefName"] if pr else (prev.get("branch") or own)
+        if not branch or not git(repo, "ls-remote", "--heads", "origin", branch):
+            die(f"the branch of {prev['name']} is not on GitHub; a cloud round needs it")
+        f = HOME / f".fix-{name}.md"
+        f.write_text(brief + "\n\n" + FIX.format(round=rnd + 1, branch=branch, where="",
+                                                findings=found))
+        a = argparse.Namespace(repo=str(repo), name=name, brief_file=str(f), model=args.model,
+                               base=branch, allow_unpushed=True, environment=t.get("environment"))
+        try:
+            cmd_cloud(a)
+        finally:
+            f.unlink(missing_ok=True)
+        tasks = load_tasks()
+        for x in tasks:
+            if x["name"] == name:  # the review of a round reads the whole change
+                x.update(kind="fix", of=args.name, round=rnd, base=t.get("base"))
+        save_tasks(tasks)
+        return
+
+    wt = repo / ".claude" / "worktrees" / args.name if t.get("worktree") else repo
+    if not wt.is_dir():
+        die(f"{wt} is gone (the task was cleaned?); there is nothing to continue")
+    live = sessions()
+    if any(live.get(x["id"], {}).get("state") == "working" and not (RESULTS / f"{x['name']}.md").exists()
+           for x in tasks if x["where"] == "local" and x["name"] in (args.name, last["name"])):
+        die(f"a session of {args.name} is still working in {wt}; wait for it first")
+    branch = t["branch"]
+    if git(wt, "branch", "--show-current") != branch:
+        die(f"{wt} is not on {branch}; something else moved it. Ask the owner.")
+    dirty = [l for l in git(wt, "status", "--porcelain").splitlines()
+             if not l[3:].endswith(JUNK + tuple(cfg.get("leftovers", [])))]
+    if dirty:
+        die(f"{wt} holds uncommitted changes; a new round would mix with them:\n  "
+            + "\n  ".join(l[3:] for l in dirty))
+    check_limit(tasks, cfg)
+    result = RESULTS / f"{name}.md"
+    full = "\n\n".join([
+        brief,
+        FIX.format(round=rnd + 1, branch=branch, where=f" in {wt}", findings=found),
+        RULES.format(branch=branch, extra=cfg.get("extra_rules", ""), push=LOCAL_PUSH.format(branch=branch)),
+        LOCAL_REPORT.format(result=result, branch=branch, notify=notify_text(cfg, name)),
+    ])
+    for d in (RESULTS, BRIEFS):
+        d.mkdir(parents=True, exist_ok=True)
+    (BRIEFS / f"{name}.md").write_text(full + "\n")
+    result.unlink(missing_ok=True)
+    model = pick_model(args, cfg, "local")
+    task = {
+        "name": name, "where": "local", "kind": "fix", "of": args.name, "round": rnd,
+        "model": model, "id": start_bg(wt, name, full, False, model), "repo": str(repo),
+        "cwd": str(wt), "branch": branch, "base": t.get("base"), "worktree": False,
+        "needs_local": bool(t.get("needs_local")), "started": int(time.time()),
+    }
+    save_tasks(tasks + [task])
+    print(f"started fix {name} id={task['id']} repo={repo.name} branch={branch} "
+          f"round {rnd + 1} of {limit + 1}, {len(findings)} finding{'s' if len(findings) != 1 else ''}")
+
+
 def cmd_wait(args):
     """Block until the named tasks (default: all of them) have reported or stopped.
 
@@ -836,7 +961,7 @@ def cmd_status(args, cs=None):
                 state, note = "stopped-no-report", f"claude logs {t['id']}"
             else:
                 state, note = "gone", "session no longer listed and left no report"
-        where = "review" if t.get("kind") == "review" else t["where"]
+        where = {"review": "review", "fix": "fix"}.get(t.get("kind"), t["where"])
         print(f"{t['name']:<28} {where:<6} {state:<20} {age:>4}m  {Path(t['repo']).name}  {note if 'https://' in note or len(note) <= 90 else note[:89] + '…'}")
     if cs.problem and any(t["where"] == "cloud" for t in tasks):
         print(f"note: claude.ai could not be read ({cs.problem}); cloud states come from GitHub only")
@@ -1108,6 +1233,10 @@ def main():
     s = sub.add_parser("envs", help="list the account's cloud environments (claude.ai/code)")
     s.add_argument("--json", action="store_true", help="print them as JSON")
     s.set_defaults(fn=cmd_envs)
+    s = sub.add_parser("fix", help="send a task back with its review's MAJOR CONFIRMED findings")
+    s.add_argument("name", help="the task (not its review or an earlier fix)")
+    s.add_argument("--model", help="model for the new round")
+    s.set_defaults(fn=cmd_fix)
     s = sub.add_parser("sessions", help="list the account's cloud sessions (what teleport lists)")
     s.add_argument("--all", action="store_true", help="archived sessions too")
     s.add_argument("--limit", type=int, default=30, help="at most this many (default 30)")

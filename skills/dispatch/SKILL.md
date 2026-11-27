@@ -1,7 +1,7 @@
 ---
 name: dispatch
 description: Run tasks in other Claude Code sessions (local background sessions or cloud sessions) and manage them from this one, so the work does not fill this session's context. Use when the user wants to dispatch, delegate or fan out tasks to separate sessions, run something in the background or in the cloud, check on or collect dispatched work, or move running work to the cloud before closing the laptop ("dispatch these", "run this in the cloud", "how are my sessions doing", "I have to leave, hand it off").
-argument-hint: "<tasks> | status | sessions | adopt <id> | envs | collect | review <name> | handoff"
+argument-hint: "<tasks> | status | sessions | adopt <id> | envs | collect | review <name> | fix <name> | handoff"
 ---
 
 # dispatch
@@ -17,6 +17,7 @@ D="${CLAUDE_SKILL_DIR}/scripts/dispatch.py"   # scripts/ next to this file
 python3 $D local  --repo <dir> --name <name> --brief-file <file> [--needs-local] [--no-worktree] [--model <id>]
 python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch>] [--model <id>] [--environment <name|id>]
 python3 $D review <name> [--model <id>]
+python3 $D fix    <name> [--model <id>]
 python3 $D wait   [<name> ...] [--timeout <seconds>]   # local and cloud tasks
 python3 $D status [--repo <dir>]
 python3 $D envs   [--json]
@@ -169,7 +170,18 @@ did not write the change checks it.
    status line of every task when the named ones have reported, and starts with a
    `still running after ...` line when the time ran out first. If some reviews are
    still running then, report the rest now and say which are pending.
-3. **Report.** Run `result <name>` and `result <name>-review` for each task and give the
+3. **Send back what failed.** For each task whose newest review has a finding that is
+   MAJOR and CONFIRMED, run `fix <name>` (always the task's own name, not a round's).
+   It starts a new round: a new session on the same branch (a local one in the task's
+   own worktree, a cloud one from its pushed branch) with the original brief and only
+   those findings. MINOR and PLAUSIBLE findings are never sent back: they are the
+   user's call. Then `wait <name>-fix<N>`, `review <name>-fix<N>`, `wait` for that
+   review, and repeat while the newest review still has MAJOR CONFIRMED findings. The
+   helper stops after `max_fix_rounds` rounds (default 2, exit code 7): then the task
+   goes to the user as it is. A round that reports `failed` or `blocked` stops the loop
+   too. Skip this step when the user says so ("collect, no fixes").
+   A round's review reads the whole change since the task started, not only the round.
+4. **Report.** Run `result <name>` and `result <name>-review` for each task and give the
    user the tasks in order of the review's `RISK`, highest first:
    - `high`, or any finding that is MAJOR and CONFIRMED: what changed, the branch or
      pull request, each such finding with its file and line, and what the user must
@@ -181,16 +193,19 @@ did not write the change checks it.
    When the writer says a check passed and the review ran the same check and it
    failed, say so first. Small differences in wording or line numbers are not that.
 
+   A task that went through rounds is reported once, by its newest review, with how
+   many rounds it took and what the rounds fixed.
+
    Then list the tasks that have no review, with their state in a line each: still
    running, `quiet`, `failed`, `blocked` (with its question), or not reviewed and why.
-4. **Findings are the user's call.** Do not fix them yourself and do not start a fix
-   without being asked. If the user wants one, dispatch a new task whose brief names
-   the branch to continue and quotes the confirmed findings.
-5. **Clean up** when the user agrees. A local task's commits exist only on its branch
+5. **The rest is the user's call.** Do not fix anything yourself. For a MINOR or
+   PLAUSIBLE finding the user wants fixed, or a task out of rounds, dispatch a new
+   task whose brief names the branch to continue and quotes the findings.
+6. **Clean up** when the user agrees. A local task's commits exist only on its branch
    on this machine (unless it handed off or was asked to push; its report says), so
    first ask what to do with each branch: merge it, push it, or drop it. Do the merge
-   or push yourself only when the user says so for that branch. Clean a task's review
-   before the task. Then `clean <name>` removes the session, its worktree and its line in the
+   or push yourself only when the user says so for that branch. Clean a task's reviews
+   and fix rounds before the task. Then `clean <name>` removes the session, its worktree and its line in the
    list. It deletes what tools leave behind in the worktree (`__pycache__/`, `.serena/`
    and the like, plus the `leftovers` in the config) and refuses when anything else is
    uncommitted: show the user those files and do not force it. The task's commits
@@ -200,7 +215,8 @@ did not write the change checks it.
 
 Never merge a branch or pull request on your own judgement, whatever the review says.
 
-`/dispatch review <name>` runs steps 1 to 3 for one task.
+`/dispatch review <name>` runs steps 1, 2 and 4 for one task; `/dispatch fix <name>` runs
+step 3 for one task.
 
 ## `/dispatch handoff`
 
@@ -227,6 +243,9 @@ every local task that `status` shows as `running`:
 4. `claude stop <id>` if it is still running. Keep the local worktree until the cloud
    task is collected.
 
+**A fix round** (`fix` in the `where` column) is handed off like a task. Its worktree is
+its task's (`<repo>/.claude/worktrees/<task>`, the `cwd` in `tasks.jsonl`).
+
 **A review** (`review` in the `where` column): stop it with `claude stop <id>` and
 `forget` it. It is short, and `collect` starts it again later.
 
@@ -252,6 +271,7 @@ prints the command).
 ```json
 {
   "max_parallel": 4,
+  "max_fix_rounds": 2,
   "cloud_model": "claude-opus-5-5",
   "cloud_environment": "light",
   "environments": {"light": "env_...", "vpn": "env_..."},
@@ -263,6 +283,7 @@ prints the command).
 ```
 
 - `max_parallel`: local sessions allowed to run at once (default 4).
+- `max_fix_rounds`: how many times `fix` may send one task back (default 2).
 - `cloud_model`, `local_model`: the model every cloud session, or every local session
   and review, starts on. Without them a session uses the account's default. Pass
   `--model` only when the user names a model for one task; it wins over the config.

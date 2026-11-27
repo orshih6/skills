@@ -11,10 +11,11 @@ Standard library only. State lives in ~/.claude/dispatch/ (never in a repo):
 A review is a local task named <name>-review: a new session that did not write the
 change reads the finished task's branch and reports a verdict.
 
-Commands: local, cloud, review, wait, status, result, clean, forget. Run with -h for flags.
+Commands: local, cloud, review, wait, status, envs, result, clean, forget. Run with -h for flags.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import pty
@@ -24,6 +25,9 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 HOME = Path(os.environ.get("DISPATCH_HOME", Path.home() / ".claude" / "dispatch"))
@@ -261,22 +265,125 @@ def pick_model(args, cfg, where):
     return getattr(args, "model", None) or cfg.get(f"{where}_model") or None
 
 
+def claude_config_dir():
+    """Where the claude CLI keeps its login: CLAUDE_CONFIG_DIR, else ~/.claude."""
+    return os.environ.get("CLAUDE_CONFIG_DIR")
+
+
+def claude_login():
+    """(access token, organization uuid) of the claude CLI's claude.ai login.
+
+    The same login `claude --cloud` uses, read where the CLI keeps it: the
+    CLAUDE_CODE_OAUTH_TOKEN variable, `.credentials.json` in its config folder, or the
+    macOS Keychain. Never printed and never written anywhere.
+    """
+    custom = claude_config_dir()
+    folder = Path(custom) if custom else Path.home() / ".claude"
+    token, expires = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), None
+    if not token:
+        raw = None
+        creds = folder / ".credentials.json"
+        if creds.exists():
+            raw = creds.read_text()
+        elif sys.platform == "darwin" and shutil.which("security"):
+            service = "Claude Code-credentials"
+            if custom:  # each config folder has its own Keychain item
+                service += "-" + hashlib.sha256(custom.encode()).hexdigest()[:8]
+            r = run(["security", "find-generic-password", "-s", service, "-w"])
+            raw = r.stdout if r.returncode == 0 else None
+        try:
+            oauth = json.loads(raw or "{}").get("claudeAiOauth") or {}
+        except json.JSONDecodeError:
+            oauth = {}
+        token, expires = oauth.get("accessToken"), oauth.get("expiresAt")
+    if not token:
+        die("no claude.ai login found for the claude CLI. Run `claude` and sign in with "
+            "your subscription (/login), then try again.", 6)
+    if expires and expires / 1000 < time.time():
+        die("the claude CLI's login has expired. Start `claude` once so it renews the "
+            "login, then try again.", 6)
+    state = (Path(custom) if custom else Path.home()) / ".claude.json"
+    try:
+        org = json.loads(state.read_text()).get("oauthAccount", {}).get("organizationUuid")
+    except (OSError, json.JSONDecodeError):
+        org = None
+    if not org:
+        die(f"no organization found in {state}. Run `claude` and sign in, then try again.", 6)
+    return token, org
+
+
+def api_get(path, token, org, extra_headers=None, optional=False):
+    """GET a claude.ai API path as JSON. Stops with an error, or gives None when optional."""
+    url = os.environ.get("DISPATCH_API_URL", "https://api.anthropic.com") + path
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}", "x-organization-uuid": org,
+        "anthropic-version": "2023-06-01", "Content-Type": "application/json",
+        **(extra_headers or {}),
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if optional:
+            return None
+        die(f"GET {path} failed: HTTP {e.code}. If it is 401, start `claude` once so it "
+            "renews the login.", 6)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+        if optional:
+            return None
+        die(f"GET {path} failed: {e}", 6)
+
+
+def cloud_environments():
+    """The account's cloud environments and self-hosted pools, as claude.ai/code lists them.
+
+    Each is {"id", "name", "kind", "state", "description"}. This is the API that
+    `/remote-env` in the CLI calls. It is not documented and may change with a CLI update.
+    """
+    token, org = claude_login()
+    found, after = [], None
+    for _ in range(20):
+        q = "?limit=100" + (f"&after_id={urllib.parse.quote(after)}" if after else "")
+        page = api_get("/v1/environment_providers" + q, token, org)
+        envs = page.get("environments") or []
+        found += [{"id": e.get("environment_id"), "name": e.get("name") or "",
+                   "kind": e.get("kind") or "", "state": e.get("state") or "",
+                   "description": e.get("description") or ""} for e in envs]
+        after = page.get("last_id")
+        if not page.get("has_more") or not envs or not after:
+            break
+    # self-hosted pools are optional; an account without them may refuse the call
+    pools = (api_get("/v1/code/runners/self-hosted/pools", token, org,
+                     {"anthropic-beta": "ccr-byoc-2025-07-29"}, optional=True) or {}).get("pools") or []
+    found += [{"id": p.get("pool_id"), "name": p.get("name") or "", "kind": "self_hosted_pool",
+               "state": f"{p.get('alive_runner_count', 0)} runners", "description": ""}
+              for p in pools]
+    return [e for e in found if e["id"]]
+
+
 def pick_environment(args, cfg):
     """The cloud environment for a task, as (label, id, extra claude arguments).
 
     --environment wins, then the config's cloud_environment. Either may be a name from
-    the config's `environments` map or an id. Nothing chosen: the account's default.
+    the config's `environments` map, an id, or the name the environment has on
+    claude.ai/code (looked up live). Nothing chosen: the account's default.
     """
     want = getattr(args, "environment", None) or cfg.get("cloud_environment")
     if not want:
         return None, None, []
     envs = cfg.get("environments", {})
     env_id = envs.get(want, want)
+    if not env_id.startswith(("env_", "ccpool_")):
+        live = [e for e in cloud_environments() if e["state"] != "archived"]
+        hits = [e for e in live if e["name"].casefold() == want.casefold()]
+        if len(hits) != 1:
+            names = sorted(set(envs) | {e["name"] for e in live})
+            die(f"{'several environments are' if hits else 'no environment is'} named "
+                f"{want!r}. Use an id (env_... or ccpool_...) or one of: "
+                f"{', '.join(repr(n) for n in names) or 'none'}. `envs` lists them.")
+        env_id = hits[0]["id"]
     if env_id.startswith("ccpool_"):  # a self-hosted environment has its own flag
         return want, env_id, ["--environment", env_id]
-    if not env_id.startswith("env_"):
-        die(f"unknown environment {want!r}: use an id (env_... or ccpool_...) or one of the "
-            f"names in {CONFIG}: {', '.join(sorted(envs)) or 'none defined'}")
     # a hosted environment is chosen through the setting the CLI reads its default from
     return want, env_id, ["--settings", json.dumps({"remote": {"defaultEnvironmentId": env_id}})]
 
@@ -682,6 +789,35 @@ def cmd_forget(args):
     print(f"forgot {args.name} (the session, its branch and its report file are untouched)")
 
 
+def cmd_envs(args):
+    """One line per cloud environment: name, id, kind, state, and its role in the config."""
+    cfg = load_config()
+    envs = cloud_environments()
+    if args.json:
+        print(json.dumps(envs, indent=2))
+        return
+    if not envs:
+        print("no cloud environments: create one on claude.ai/code (or with /remote-env)")
+        return
+    names = {}
+    for n, i in cfg.get("environments", {}).items():
+        names.setdefault(i, []).append(n)
+    default = cfg.get("cloud_environment")
+    default = cfg.get("environments", {}).get(default, default)
+    for e in envs:
+        notes = [f"config name: {', '.join(names[e['id']])}"] if e["id"] in names else []
+        if default and default in (e["id"], e["name"]):
+            notes.append("cloud_environment")
+        print(f"{e['name']!r} id={e['id']} kind={e['kind']} state={e['state']}"
+              + (f" ({'; '.join(notes)})" if notes else ""))
+    known = {e["id"] for e in envs}
+    for n, i in cfg.get("environments", {}).items():
+        if i not in known:
+            print(f"warning: the config name {n!r} points to {i}, which this login "
+                  f"({claude_config_dir() or '~/.claude'}) does not have. It may belong to "
+                  "another claude login (CLAUDE_CONFIG_DIR).")
+
+
 def main():
     p = argparse.ArgumentParser(prog="dispatch.py", description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -712,6 +848,9 @@ def main():
     s.add_argument("names", nargs="*", help="task names (default: every local task)")
     s.add_argument("--timeout", type=int, default=540, help="seconds to wait at most")
     s.set_defaults(fn=cmd_wait)
+    s = sub.add_parser("envs", help="list the account's cloud environments (claude.ai/code)")
+    s.add_argument("--json", action="store_true", help="print them as JSON")
+    s.set_defaults(fn=cmd_envs)
     for name, fn, text in (
         ("review", cmd_review, "start a new session that reviews a finished task's branch"),
         ("result", cmd_result, "print a task's report"),

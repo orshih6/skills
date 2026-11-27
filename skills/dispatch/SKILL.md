@@ -1,7 +1,7 @@
 ---
 name: dispatch
 description: Run tasks in other Claude Code sessions (local background sessions or cloud sessions) and manage them from this one, so the work does not fill this session's context. Use when the user wants to dispatch, delegate or fan out tasks to separate sessions, run something in the background or in the cloud, check on or collect dispatched work, or move running work to the cloud before closing the laptop ("dispatch these", "run this in the cloud", "how are my sessions doing", "I have to leave, hand it off").
-argument-hint: "<tasks> | status | collect | review <name> | handoff"
+argument-hint: "<tasks> | status | envs | collect | review <name> | handoff"
 ---
 
 # dispatch
@@ -19,6 +19,7 @@ python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch
 python3 $D review <name> [--model <id>]
 python3 $D wait   [<name> ...] [--timeout <seconds>]
 python3 $D status [--repo <dir>]
+python3 $D envs   [--json]
 python3 $D result <name>
 python3 $D clean  <name>
 python3 $D forget <name>
@@ -91,6 +92,26 @@ Run `status` and show its lines as a table. States:
   user the link and ask them to look; do not start it again on a guess. If the push
   failed, the user installs the app and then tells that session, in the browser, to
   push its branch and open the pull request as its brief says.
+
+## `/dispatch envs`
+
+Run `envs` and show its lines as a table: name, id, kind, state, and the name the config
+gives it, if any. It lists the account's cloud environments as claude.ai/code has them,
+which is the same list `/remote-env` shows. It reads the claude CLI's own claude.ai login
+(the Keychain on macOS, else `.credentials.json` in the CLI's config folder) and never
+prints it. It lists them for the login that `claude --cloud` in this session uses: with
+`CLAUDE_CONFIG_DIR` set, that is a different login, and it can have different environments.
+
+- A line ending in `cloud_environment` is the one every cloud task uses by default.
+- A `warning:` line means a config name points to an id this login does not have. Tell
+  the user: the id may belong to another login, or the environment was deleted.
+- Use it before choosing an environment for a cloud task, and when the user asks which
+  environments there are. `--environment` also accepts an environment's claude.ai name
+  (any case), so a config entry is optional.
+
+It calls an API with no documentation (`GET /v1/environment_providers`, the one
+`/remote-env` uses), so a Claude Code update can break it. If it fails, say so and fall
+back to ids from the config or from claude.ai/code.
 
 ## `/dispatch collect`
 
@@ -208,10 +229,11 @@ prints the command).
 - `cloud_model`, `local_model`: the model every cloud session, or every local session
   and review, starts on. Without them a session uses the account's default. Pass
   `--model` only when the user names a model for one task; it wins over the config.
-- `environments`: names for the user's cloud environments, each with its id (the user
-  copies the id from the environment's settings on claude.ai/code; nothing on this
-  machine can list them). `cloud_environment` is the one every cloud task uses, as a
-  name or an id. Without it a task runs on the account's default environment.
+- `environments`: short names for the user's cloud environments, each with its id.
+  Optional: `envs` lists the ids, and `--environment` also takes an environment's
+  claude.ai name. `cloud_environment` is the one every cloud task uses, as a config
+  name, a claude.ai name or an id. Without it a task runs on the account's default
+  environment.
 - `local_only`: repo directory names that must never go to the cloud.
 - `notify`: a command each local session runs once when it reports.
 - `leftovers`: endings of untracked paths that `clean` may delete from a worktree, on
@@ -238,7 +260,7 @@ prints the command).
   worktrees do not show up in `git status`.
 - A cloud session works on a clone from GitHub. It never sees local files or secrets.
   It runs on the config's `cloud_environment`, or on the one given with
-  `--environment` for that task. The environment's setup script runs before every
+  `--environment` for that task (`envs` lists them). The environment's setup script runs before every
   task, so a heavy one delays them all: pick the lightest environment that has what the
   task needs (its network access, its secrets), and say which one you chose when you
   tell the user what was started. The start line prints it.

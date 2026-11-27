@@ -721,6 +721,125 @@ def clean_checks(e):
     same([t["name"] for t in e.tasks()], ["delta"], "tasks after a clean that failed")
 
 
+# envs (a stand-in for the claude.ai API on 127.0.0.1) ------------------------------------
+
+
+ENV_PAGES = {
+    None: {"environments": [
+        {"environment_id": "env_light1", "name": "Light", "kind": "anthropic_cloud", "state": "active"},
+        {"environment_id": "env_vpn1", "name": "VPN", "kind": "anthropic_cloud", "state": "active"},
+    ], "has_more": True, "last_id": "env_vpn1"},
+    "env_vpn1": {"environments": [
+        {"environment_id": "env_old1", "name": "Old", "kind": "anthropic_cloud", "state": "archived"},
+    ], "has_more": False, "last_id": "env_old1"},
+}
+
+
+def fake_api(seen):
+    import http.server
+    import threading
+    from urllib.parse import parse_qs, urlparse
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = urlparse(self.path)
+            seen.append((u.path, {k.lower(): v for k, v in self.headers.items()}))
+            if self.headers.get("Authorization") != "Bearer tok-123":
+                body, code = {"error": "unauthorized"}, 401
+            elif u.path == "/v1/environment_providers":
+                body, code = ENV_PAGES[parse_qs(u.query).get("after_id", [None])[0]], 200
+            else:  # no self-hosted pools on this account
+                body, code = {"error": "not found"}, 404
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+@check("envs: lists the account's environments and resolves a name")
+def envs_checks(e):
+    seen = []
+    srv = fake_api(seen)
+    try:
+        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"):
+            e.env.pop(k, None)
+        e.env["DISPATCH_API_URL"] = f"http://127.0.0.1:{srv.server_address[1]}"
+        refused(e.d("envs"), "no claude.ai login", "no login", code=6)
+
+        (e.dir / ".claude").mkdir()
+        creds = e.dir / ".claude" / ".credentials.json"
+        creds.write_text(json.dumps({"claudeAiOauth": {"accessToken": "tok-123",
+                                                       "expiresAt": 1000}}))
+        refused(e.d("envs"), "has expired", "an expired login", code=6)
+        creds.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "tok-123", "expiresAt": int(time.time() + 3600) * 1000}}))
+        refused(e.d("envs"), "no organization", "no organization", code=6)
+        (e.dir / ".claude.json").write_text(json.dumps({"oauthAccount": {"organizationUuid": "org-9"}}))
+
+        (e.home / "config.json").write_text(json.dumps({
+            "cloud_environment": "light",
+            "environments": {"light": "env_light1", "gone": "env_gone1"}}))
+        r = e.d("envs")
+        same(r.returncode, 0, f"envs exit code ({r.stderr.strip()})")
+        lines = r.stdout.splitlines()
+        has(lines[0], "'Light' id=env_light1", "first environment")
+        has(lines[0], "config name: light; cloud_environment", "config roles")
+        has(lines[2], "'Old' id=env_old1 kind=anthropic_cloud state=archived", "the second page")
+        has(r.stdout, "'gone' points to env_gone1", "a config id the account lacks")
+        expect("tok-123" not in r.stdout + r.stderr, "the token was printed")
+        path, headers = seen[-3]
+        same(headers.get("x-organization-uuid"), "org-9", "organization header")
+
+        r = e.d("envs", "--json")
+        same([x["id"] for x in json.loads(r.stdout)], ["env_light1", "env_vpn1", "env_old1"], "--json ids")
+
+        os.environ["DISPATCH_HOME"] = str(e.home)
+        saved = {k: os.environ.get(k) for k in ("HOME", "DISPATCH_API_URL", "CLAUDE_CONFIG_DIR",
+                                                "CLAUDE_CODE_OAUTH_TOKEN")}
+        os.environ.update(HOME=str(e.dir), DISPATCH_API_URL=e.env["DISPATCH_API_URL"])
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        try:
+            spec = importlib.util.spec_from_file_location("dispatch_envs", DISPATCH)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            class A:
+                environment = None
+
+            def pick(want, cfg=None):
+                A.environment = want
+                return mod.pick_environment(A(), cfg or {})[:2]
+
+            same(pick("vpn"), ("vpn", "env_vpn1"), "a claude.ai name, any case")
+            same(pick("light", {"environments": {"light": "env_x"}}), ("light", "env_x"),
+                 "a config name wins over a claude.ai name")
+            same(pick("env_direct"), ("env_direct", "env_direct"), "an id needs no lookup")
+            for want in ("old", "nope"):  # archived, or not there
+                try:
+                    pick(want)
+                    raise Failure(f"{want!r} was accepted")
+                except SystemExit:
+                    pass
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    finally:
+        srv.shutdown()
+
+
 def main():
     only = sys.argv[1:]
     chosen = [(n, f) for n, f in CHECKS if not only or any(o in n for o in only)]

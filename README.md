@@ -13,6 +13,7 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
 ```
 /dispatch fix the flaky login test; add CSV export to the reports page
 /dispatch status
+/dispatch envs
 /dispatch collect
 /dispatch review fix-flaky-login-test
 /dispatch handoff
@@ -24,6 +25,10 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
 - **`status`** shows one line per task. A cloud task is judged by what reached GitHub
   (a pull request or a pushed branch); one with nothing there after 20 minutes shows as
   `quiet`: it may still be working or be stuck, so open its link and look.
+- **`envs`** lists your cloud environments as claude.ai/code has them (the same list as
+  `/remote-env`), with the name your config gives each one. A cloud task can then pick
+  one by that claude.ai name: `--environment "Light"`. It uses the claude CLI's
+  own login and an undocumented API, so a Claude Code update may break it.
 - **`collect`** first has each finished task reviewed by a new session that did not
   write it and has not seen its report, then gives the results in order of risk, with
   the findings the reviewer could confirm. `/dispatch review <name>` does it for one task.
@@ -51,6 +56,9 @@ Optional, in `~/.claude/dispatch/config.json` (local to the machine, never commi
 - `max_parallel`: how many local sessions may run at once (default 4; reviews count).
 - `cloud_model`: the model every cloud session starts on.
 - `local_model`: the model every local session and review starts on.
+- `cloud_environment`: the cloud environment every cloud task uses (a config name, a
+  claude.ai name, or an id).
+- `environments`: short names for environment ids. Optional, since `envs` lists the ids.
 - `local_only`: repo directory names that must never go to the cloud.
 - `notify`: a command each local session runs once when it reports (`{name}` is the task).
 - `leftovers`: extra untracked paths `clean` may delete from a worktree.

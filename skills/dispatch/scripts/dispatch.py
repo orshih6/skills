@@ -44,10 +44,19 @@ You were started by a manager session and nobody is watching you work.
 - Put your work on the branch `{branch}`. Never commit to or push the default branch,
   never merge, never deploy, never spend money, never message or email anyone.
   If the task cannot be finished without one of those, stop and report `blocked`.
+{push}
 - Do not ask questions and wait: nobody will answer. If you need a decision, report
   `blocked` with the question.
 - Before you report `done`, run the project's tests or build and say what happened.
 {extra}"""
+
+LOCAL_PUSH = """\
+- Commit your work to `{branch}` and leave it on this machine. Do not push the branch
+  and do not open a pull request unless the task above asks for one, even if the
+  project's own instructions say to push finished work: another session reviews the
+  branch first, and the owner decides what leaves the machine."""
+
+CLOUD_PUSH = "- Push only the branch named above."
 
 LOCAL_REPORT = """\
 ## Reporting (required, last step)
@@ -56,7 +65,7 @@ Write your result to `{result}` in exactly this shape, then stop:
 
     STATUS: done | failed | blocked
     BRANCH: <branch name, or none>
-    PR: <url, or none>
+    PR: <url, or none (none unless the task asked for a pull request)>
     TESTS: <command you ran and whether it passed, or not run and why>
     SUMMARY: <2 to 5 lines: what changed, what is left, anything the owner must decide>
 
@@ -127,9 +136,11 @@ Write your result to `{result}` in exactly this shape, then stop:
     RISK: low | normal | high
     CHECKS: <each command you ran and the last lines of its output, or not run and why>
     FINDINGS:
-    1. CONFIRMED | PLAUSIBLE  <file>:<line>  <what goes wrong, and with which input>
+    1. MAJOR | MINOR  CONFIRMED | PLAUSIBLE  <file>:<line>  <what goes wrong, and with which input>
 
-Write `FINDINGS: none` when there are none. RISK is about what the change touches, not
+Write `FINDINGS: none` when there are none. A finding is MAJOR when the change does not
+do something the task calls done, or breaks something that worked before; everything
+else is MINOR. Use `VERDICT: clean` when there are no findings. RISK is about what the change touches, not
 about its quality: `high` for money, a database schema, sign-in or permissions, deleting
 data, or deploy configuration; `low` for documentation or UI text only; `normal` for
 the rest. Use `STATUS: failed` only when you could not review at all, and say why under
@@ -219,10 +230,24 @@ def notify_text(cfg, name):
     )
 
 
+def hide_worktrees(repo):
+    """List .claude/worktrees/ in the repo's own exclude file (local, never committed)."""
+    common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not common:
+        return
+    f = Path(common) / "info" / "exclude"
+    line = ".claude/worktrees/"
+    old = f.read_text() if f.exists() else ""
+    if line not in old.splitlines():
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(old + ("" if old.endswith("\n") or not old else "\n") + line + "\n")
+
+
 def start_bg(repo, name, prompt, worktree):
     """Start a local background session and return its short id."""
     cmd = ["claude", "--bg", "-n", name]
     if worktree:
+        hide_worktrees(repo)
         cmd += ["-w", name]
     cmd.append(prompt)
     r = run(cmd, cwd=repo, timeout=120)
@@ -248,7 +273,7 @@ def cmd_local(args):
     extra = cfg.get("extra_rules", "")
     full = "\n\n".join([
         brief,
-        RULES.format(branch=branch, extra=extra),
+        RULES.format(branch=branch, extra=extra, push=LOCAL_PUSH.format(branch=branch)),
         LOCAL_REPORT.format(result=result, branch=branch, notify=notify),
     ])
     for d in (RESULTS, BRIEFS):
@@ -319,7 +344,7 @@ def cmd_cloud(args):
     full = "\n\n".join([
         brief,
         f"Start from the branch `{base}`.",
-        RULES.format(branch=branch, extra=cfg.get("extra_rules", "")),
+        RULES.format(branch=branch, extra=cfg.get("extra_rules", ""), push=CLOUD_PUSH),
         CLOUD_REPORT.format(branch=branch),
     ])
     BRIEFS.mkdir(parents=True, exist_ok=True)
@@ -436,10 +461,10 @@ def read_result(name):
     if v:  # a review: its note is the verdict, the risk and how many findings
         r = re.search(r"^RISK:\s*(\w+)", text, re.M)
         n = len(re.findall(r"^\s*\d+\.\s", text.split("FINDINGS:")[-1], re.M)) if "FINDINGS:" in text else 0
-        c = len(re.findall(r"^\s*\d+\.\s+CONFIRMED", text, re.M))
+        major = len(re.findall(r"^\s*\d+\.\s+MAJOR\s+CONFIRMED", text, re.M))
         note = f"{v.group(1).lower()}, risk {r.group(1).lower() if r else 'unknown'}"
         if n:
-            note += f", {n} finding{'s' if n != 1 else ''} ({c} confirmed)"
+            note += f", {n} finding{'s' if n != 1 else ''} ({major} major confirmed)"
         return status, note
     # The summary is 2 to 5 lines: it may start on the SUMMARY: line or below it, and
     # runs to the end of the report, or to another report field if one follows.
@@ -477,11 +502,13 @@ def cmd_status(args):
             s = live.get(t["id"])
             rstat, summary = read_result(t["name"])
             cli = s.get("state") if s else "gone"
-            # working: still going; blocked: waiting for a person; done: stopped
-            if cli == "working":
-                state, note = "running", ""
-            elif rstat:
+            # A report means the task is over, even while the CLI still lists the session
+            # as working (it is only wrapping up). Then: working, blocked (waiting for a
+            # person), done (stopped).
+            if rstat:
                 state, note = rstat, summary
+            elif cli == "working":
+                state, note = "running", ""
             elif cli == "blocked":
                 state, note = "waiting-for-you", f"claude attach {t['id']}"
             elif cli == "done":

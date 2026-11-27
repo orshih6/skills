@@ -56,7 +56,9 @@ It keeps its state in `~/.claude/dispatch/` (task list, briefs, reports), never 
 
 What the helper adds to every brief: work on its own branch, never push the default
 branch, never merge, deploy, spend or message anyone, never wait on a question, run the
-tests, and report in a fixed shape. Read `scripts/dispatch.py` if you need the wording.
+tests, and report in a fixed shape. A local task commits to its branch and does not
+push it or open a pull request unless the brief asks; a cloud task always pushes its
+branch and opens a pull request, because that is the only way its work comes back. Read `scripts/dispatch.py` if you need the wording.
 
 ### When the helper refuses
 
@@ -71,7 +73,7 @@ tests, and report in a fixed shape. Read `scripts/dispatch.py` if you need the w
 
 Run `status` and show its lines as a table. States:
 
-- `running`: still working.
+- `running`: still working, with no report yet.
 - `done` / `failed` / `blocked` / `handoff`: the session's own report.
 - `waiting-for-you`: it stopped on a prompt. Give the user the `claude attach <id>` shown.
 - `stopped-no-report`: it ended without reporting. Only then look at its log, and only
@@ -86,28 +88,33 @@ did not write the change checks it.
 
 1. **Review.** For each task that reports `done` and has no `<name>-review` task yet,
    run `review <name>`. It starts a new local session in its own worktree. That session
-   gets the original brief and the branch's diff, not the writer's report or reasoning,
-   and it marks each finding CONFIRMED (reproduced, or the failing lines are named) or
-   PLAUSIBLE. Do not review tasks that report `failed` or `blocked`, and skip the step
+   gets the original brief and the branch's diff, not the writer's report or reasoning.
+   It marks each finding MAJOR (the change misses something the task calls done, or
+   breaks something that worked) or MINOR, and CONFIRMED (reproduced, or the failing
+   lines are named) or PLAUSIBLE. Do not review tasks that report `failed` or `blocked`, and skip the step
    when the user says so ("collect, no review"). The review of a cloud task also runs
    on this machine, on the branch fetched from GitHub.
 2. **Wait** for the reviews: `wait <name>-review ... --timeout 540`. If some are still
    running when it returns, report the rest now and say which reviews are pending.
 3. **Report.** Run `result <name>` and `result <name>-review` for each task and give the
    user the tasks in order of the review's `RISK`, highest first:
-   - `high`, or any CONFIRMED finding: what changed, branch or pull request, each
-     confirmed finding with its file and line, and what the user must decide. Say that
-     a person should read this one.
-   - `normal`: two or three lines, and the PLAUSIBLE findings named as unconfirmed.
+   - `high`, or any finding that is MAJOR and CONFIRMED: what changed, the branch or
+     pull request, each such finding with its file and line, and what the user must
+     decide. Say that a person should read this one.
+   - `normal`: two or three lines, then the other findings in a line each, with the
+     PLAUSIBLE ones named as unconfirmed.
    - `low` and `clean`: one line.
 
    When the review's checks disagree with the writer's `TESTS` line, say so first.
 4. **Findings are the user's call.** Do not fix them yourself and do not start a fix
    without being asked. If the user wants one, dispatch a new task whose brief names
    the branch to continue and quotes the confirmed findings.
-5. **Clean up** when the user agrees: `claude rm <id>` removes a local session and its
-   worktree (it refuses when the worktree holds unpushed work; do not force it), and
-   `forget <name>` drops a task from the list. Do the same for the review tasks.
+5. **Clean up** when the user agrees. A local task's commits exist only on its branch
+   on this machine, so first ask what to do with each branch: merge it, push it, or
+   drop it. Then `claude rm <id>` removes the session and its worktree (it refuses when
+   the worktree holds work that is not committed or pushed; do not force it without the
+   user's word), and `forget <name>` drops the task from the list. Remove the review
+   tasks the same way; a review's worktree holds nothing to keep.
 
 Never merge a branch or pull request yourself, whatever the review says.
 
@@ -183,4 +190,6 @@ prints the command).
 - A local task gets its own git worktree (`<repo>/.claude/worktrees/<name>`, branch
   `worktree-<name>`), so sessions in one repo cannot touch each other's changes. The
   worktree starts from the last commit: uncommitted changes in the repo are not in it.
+  The helper lists `.claude/worktrees/` in the repo's `.git/info/exclude`, so the
+  worktrees do not show up in `git status`.
 - A cloud session works on a clone from GitHub. It never sees local files or secrets.

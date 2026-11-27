@@ -28,7 +28,11 @@ directory under `skills/` with a `SKILL.md` that Claude loads when you type
   session is doing, through the API `claude --teleport` uses: starting, running (with
   its own one-line status), waiting for you, failed, blocked or done. `wait` waits for
   cloud sessions too.
-- **`sessions`** lists every cloud session on your account, as `claude --teleport` does,
+- Every session dispatch starts, local or cloud, is named `dispatch-<task>`
+  (`session_prefix` in the config), so it is easy to spot in `claude agents`, on
+  claude.ai/code and in teleport's list.
+- **`sessions`** lists every cloud session on your account, as `claude --teleport` does
+  (`--dispatch` for only the ones dispatch started),
   and **`adopt <id>`** makes dispatch track one it did not start, so `status`, `wait`,
   `result` and `pull` work on it too.
 - **`pull <name|id>`** brings a cloud session's files to your machine from its history,

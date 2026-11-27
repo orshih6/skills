@@ -474,9 +474,16 @@ def pick_environment(args, cfg):
     return want, env_id, ["--settings", json.dumps({"remote": {"defaultEnvironmentId": env_id}})]
 
 
+def session_title(name, cfg=None):
+    """The name a session shows in `claude agents`, claude.ai/code and teleport's list:
+    the config's session_prefix (default `dispatch-`) and the task name."""
+    prefix = (cfg if cfg is not None else load_config()).get("session_prefix", "dispatch-")
+    return name if name.startswith(prefix) else prefix + name
+
+
 def start_bg(repo, name, prompt, worktree, model=None):
     """Start a local background session and return its short id."""
-    cmd = ["claude", "--bg", "-n", name]
+    cmd = ["claude", "--bg", "-n", session_title(name)]
     if model:
         cmd += ["--model", model]
     if worktree:
@@ -587,7 +594,7 @@ def cmd_cloud(args):
 
     model = pick_model(args, cfg, "cloud")
     env_name, env_id, env_args = pick_environment(args, cfg)
-    out = spawn_in_pty(["claude", "--cloud", full, "-n", args.name]
+    out = spawn_in_pty(["claude", "--cloud", full, "-n", session_title(args.name, cfg)]
                        + (["--model", model] if model else []) + env_args, cwd=repo,
                        timeout=300, env={"CCR_FORCE_BUNDLE": "1"})
     if "trust this folder" in out:
@@ -1095,7 +1102,9 @@ def cmd_sessions(args):
         q = "?limit=50" + (f"&cursor={urllib.parse.quote(cursor)}" if cursor else "")
         page = api_get("/v1/code/sessions" + q, token, org)
         rows = page.get("data") or []
-        found += [r for r in rows if args.all or r.get("status") != "archived"]
+        prefix = load_config().get("session_prefix", "dispatch-")
+        found += [r for r in rows if (args.all or r.get("status") != "archived")
+                  and (not args.dispatch or (r.get("title") or "").startswith(prefix))]
         cursor = page.get("next_cursor")
         if len(found) >= args.limit or not rows or not cursor:
             break
@@ -1376,6 +1385,8 @@ def main():
     s.set_defaults(fn=cmd_pull)
     s = sub.add_parser("sessions", help="list the account's cloud sessions (what teleport lists)")
     s.add_argument("--all", action="store_true", help="archived sessions too")
+    s.add_argument("--dispatch", action="store_true",
+                   help="only sessions whose name has the session_prefix (dispatch-)")
     s.add_argument("--limit", type=int, default=30, help="at most this many (default 30)")
     s.add_argument("--json", action="store_true", help="print them as JSON")
     s.set_defaults(fn=cmd_sessions)

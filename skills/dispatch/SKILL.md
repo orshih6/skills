@@ -21,7 +21,7 @@ python3 $D fix    <name> [--model <id>]
 python3 $D wait   [<name> ...] [--timeout <seconds>]   # local and cloud tasks
 python3 $D status [--repo <dir>]
 python3 $D envs   [--json]
-python3 $D sessions [--all] [--limit <n>] [--json]
+python3 $D sessions [--dispatch] [--all] [--limit <n>] [--json]
 python3 $D adopt  <session id> --name <name> --repo <dir> [--brief-file <file>]
 python3 $D pull   <name|session id> [--out <dir>] [--into-existing]
 python3 $D result <name>
@@ -60,7 +60,10 @@ It keeps its state in `~/.claude/dispatch/` (task list, briefs, reports), never 
    - what is out of scope
    Do not add rules about branches, pushing or reporting: the helper appends those.
 4. **Start them**, one helper call per task, and name each task with a short slug
-   (`fix-flaky-login-test`).
+   (`fix-flaky-login-test`). The session itself is named `dispatch-<slug>` (reviews
+   `dispatch-<slug>-review`, fix rounds `dispatch-<slug>-fix1`), in `claude agents`,
+   on claude.ai/code and in teleport's list alike, so the user can tell them apart.
+   Use the bare slug with the helper.
 5. **Tell the user** what was started as a table (task, where, name) and stop. Do not
    wait for the sessions.
 
@@ -116,7 +119,8 @@ has cost. The API has no documentation, so a Claude Code update can change it.
 
 `sessions` lists every cloud session of the account, newest first: the list
 `claude --teleport` shows, including sessions started on claude.ai or by another tool.
-Archived ones only with `--all`. Each line: id, state, last activity, repository, title,
+Archived ones only with `--all`; only the ones dispatch started (their name starts with
+`dispatch-`) with `--dispatch`. Each line: id, state, last activity, repository, title,
 `(dispatch: <name>)` when dispatch already tracks it, and the session's status line.
 Show it as a table.
 
@@ -294,6 +298,7 @@ prints the command).
 {
   "max_parallel": 4,
   "max_fix_rounds": 2,
+  "session_prefix": "dispatch-",
   "cloud_model": "claude-opus-5-5",
   "cloud_environment": "light",
   "environments": {"light": "env_...", "vpn": "env_..."},
@@ -306,6 +311,7 @@ prints the command).
 
 - `max_parallel`: local sessions allowed to run at once (default 4).
 - `max_fix_rounds`: how many times `fix` may send one task back (default 2).
+- `session_prefix`: put before every task name to name its session (default `dispatch-`).
 - `cloud_model`, `local_model`: the model every cloud session, or every local session
   and review, starts on. Without them a session uses the account's default. Pass
   `--model` only when the user names a model for one task; it wins over the config.

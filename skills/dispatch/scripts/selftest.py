@@ -310,13 +310,17 @@ def local_worktree_flags(e):
     e.started("alpha")
     c = e.starts()[0]
     prompt = e.brief_of("alpha")[:-1]
-    same(c["args"][:-1], ["--bg", "-n", "alpha", "-w", "alpha"], "flags of the start")
+    same(c["args"][:-1], ["--bg", "-n", "dispatch-alpha", "-w", "alpha"], "flags of the start")
     same(c["args"][-1], prompt, "prompt given to claude (the brief file without its last newline)")
     same(c["cwd"], str(e.repo), "directory claude was started in")
     exclude = e.repo / ".git" / "info" / "exclude"
 
     r = e.started("beta", "--no-worktree", "--needs-local", new_id="abc12346")
-    same(e.starts()[1]["args"][:-1], ["--bg", "-n", "beta"], "flags with --no-worktree")
+    same(e.starts()[1]["args"][:-1], ["--bg", "-n", "dispatch-beta"], "flags with --no-worktree")
+    e.config(session_prefix="job-")
+    e.started("omega", "--no-worktree", new_id="abc12399")
+    same(e.starts()[-1]["args"][2], "job-omega", "the session_prefix of the config")
+    e.config()
     t = e.task("beta")
     same((t["branch"], t["worktree"], t["needs_local"]), ("dispatch/beta", False, True),
          "branch, worktree, needs_local with --no-worktree --needs-local")
@@ -332,7 +336,7 @@ def local_worktree_flags(e):
     plain.mkdir()
     r = e.started("gamma", repo=plain, new_id="abc12347")
     c = e.starts()[-1]
-    same(c["args"][:-1], ["--bg", "-n", "gamma"], "flags in a folder that is not a git repository")
+    same(c["args"][:-1], ["--bg", "-n", "dispatch-gamma"], "flags in a folder that is not a git repository")
     same(c["cwd"], str(plain), "directory claude was started in for a plain folder")
     t = e.task("gamma")
     same((t["branch"], t["base"], t["worktree"]), (None, None, False),
@@ -450,7 +454,7 @@ def review_starts(e):
          f"started review alpha-review id=abc12346 repo=shop diff={base[:12]}..worktree-alpha", "output")
     c = e.starts()[-1]
     prompt = c["args"][-1]
-    same(c["args"][:-1], ["--bg", "-n", "alpha-review", "-w", "alpha-review"], "flags of the start")
+    same(c["args"][:-1], ["--bg", "-n", "dispatch-alpha-review", "-w", "alpha-review"], "flags of the start")
     same(c["cwd"], str(e.repo), "directory claude was started in")
     same(e.brief_of("alpha-review"), prompt + "\n", "brief file of the review")
     result = e.home / "results" / "alpha-review.md"

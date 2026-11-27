@@ -13,13 +13,17 @@ session's context, which is what this skill exists to avoid.
 Everything goes through one helper:
 
 ```bash
-D=~/.claude/skills/dispatch/scripts/dispatch.py
+D="${CLAUDE_SKILL_DIR}/scripts/dispatch.py"   # scripts/ next to this file
 python3 $D local  --repo <dir> --name <name> --brief-file <file> [--needs-local] [--no-worktree]
 python3 $D cloud  --repo <dir> --name <name> --brief-file <file> [--base <branch>]
 python3 $D status
 python3 $D result <name>
 python3 $D forget <name>
 ```
+
+If that path does not exist, the helper is the `scripts/dispatch.py` beside this file:
+`.claude/skills/dispatch/` in the project when the skill is installed for one project,
+`~/.claude/skills/dispatch/` when it is installed for all of them.
 
 It keeps its state in `~/.claude/dispatch/` (task list, briefs, reports), never in a repo.
 

@@ -36,8 +36,12 @@ Needs Claude Code 2.1 or newer (`claude --bg`, `claude --cloud`), `git`, Python 
 
 ```bash
 git clone https://github.com/orshih6/skills.git
+
+# for one project only
+ln -s "$PWD/skills/skills/dispatch" /path/to/project/.claude/skills/dispatch
+
+# or for all your projects
 ln -s "$PWD/skills/skills/dispatch" ~/.claude/skills/dispatch
 ```
 
-Or copy a single skill directory into `~/.claude/skills/` (all your projects) or into a
-project's `.claude/skills/` (that project only).
+Copying the skill directory works too.
